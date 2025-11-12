@@ -1,0 +1,32 @@
+name: DDLiteGS
+channels:
+  - nvidia/label/cuda-11.7.0
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip=23.0
+  - cuda-toolkit=11.7
+  - pytorch::pytorch=1.13.1
+  - pytorch::torchvision=0.14.1
+  - pytorch::torchaudio=0.13.1
+  - pytorch::pytorch-cuda=11.7
+  - plyfile
+  - tqdm
+  - pip:
+    - certifi==2025.10.5
+    - charset-normalizer==3.4.4
+    - idna==3.11
+    - joblib==1.5.2
+    - matplotlib==3.9.4
+    - natsort==8.4.0
+    - numpy==1.24.4
+    - opencv-python==4.11.0.86
+    - requests==2.32.5
+    - typing-extensions==4.15.0
+    - urllib3==2.5.0
+    - pandas==2.2.1
+    - pillow
+    - torchmetrics==0.11.4
+    - matplotlib
+    - lpips==0.1.4
