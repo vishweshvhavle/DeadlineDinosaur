@@ -157,8 +157,8 @@ class DensityControllerOfficial(DensityControllerBase):
         return
 
     @torch.no_grad()
-    def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
-        
+    def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int,densify_rate=None):
+
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
             chunk_size=xyz.shape[-1]
@@ -166,6 +166,32 @@ class DensityControllerOfficial(DensityControllerBase):
 
         clone_mask=self.get_clone_mask(scale.exp())
         split_mask=self.get_split_mask(scale.exp())
+
+        # Apply densify_rate limit if provided (DashGaussian progressive strategy)
+        if densify_rate is not None:
+            target_add = int(densify_rate * self.init_points_num)
+            total_candidates = clone_mask.sum() + split_mask.sum()
+            if total_candidates > target_add and target_add > 0:
+                # Limit the number of primitives to add
+                # Proportionally reduce both clone and split
+                clone_ratio = clone_mask.sum().float() / total_candidates
+                split_ratio = split_mask.sum().float() / total_candidates
+                target_clone = int(target_add * clone_ratio)
+                target_split = target_add - target_clone
+
+                # Limit clone mask
+                if clone_mask.sum() > target_clone:
+                    clone_indices = clone_mask.nonzero().squeeze()
+                    keep_indices = clone_indices[:target_clone]
+                    clone_mask = torch.zeros_like(clone_mask)
+                    clone_mask[keep_indices] = True
+
+                # Limit split mask
+                if split_mask.sum() > target_split:
+                    split_indices = split_mask.nonzero().squeeze()
+                    keep_indices = split_indices[:target_split]
+                    split_mask = torch.zeros_like(split_mask)
+                    split_mask[keep_indices] = True
 
         #split
         stds=scale[...,split_mask].exp()
@@ -243,11 +269,16 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,scheduler=None,current_iteration=None,current_n_primitives=None,current_render_scale=None):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
-                self.split_and_clone(optimizer,epoch)
+                # Calculate densify_rate from scheduler if available
+                densify_rate = None
+                if scheduler is not None and current_iteration is not None and current_n_primitives is not None and current_render_scale is not None:
+                    densify_rate = scheduler.get_densify_rate(current_iteration, current_n_primitives, current_render_scale)
+
+                self.split_and_clone(optimizer,epoch,densify_rate=densify_rate)
                 self.prune(optimizer,epoch)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -292,8 +323,8 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         return score
     
     @torch.no_grad()
-    def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
-        
+    def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int,densify_rate=None):
+
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
             chunk_size=xyz.shape[-1]
@@ -301,8 +332,16 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
         prune_num=self.get_prune_mask(opacity.sigmoid(),scale.exp()).sum()
 
-        cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
-        budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
+        # Use densify_rate if provided (DashGaussian progressive strategy)
+        # Otherwise fall back to original TamingGS linear schedule
+        if densify_rate is not None:
+            # DashGaussian: use scheduler's densify_rate
+            budget = int(densify_rate * self.init_points_num) + prune_num
+            budget = min(budget, xyz.shape[-1])  # Don't exceed current point count
+        else:
+            # Original TamingGS: linear interpolation to target
+            cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
+            budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
         densify_index = torch.multinomial(score, budget, replacement=False)

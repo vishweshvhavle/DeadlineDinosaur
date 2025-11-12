@@ -42,19 +42,29 @@ class SparseGaussianAdam(torch.optim.Adam):
                 sparse_adam_update(param.view(-1,N), param.grad.view(-1,N), exp_avg.view(-1,N), exp_avg_sq.view(-1,N), primitive_visible, lr, 0.9, 0.999, eps)
 
 class Scheduler(_LRScheduler):
-    def __init__(self, optimizer:torch.optim.Adam,lr_init, lr_final,max_epochs=10000, last_epoch=-1):
+    def __init__(self, optimizer:torch.optim.Adam,lr_init, lr_final,max_epochs=10000, last_epoch=-1, decay_from_iter=0):
         self.max_epochs=max_epochs
         self.lr_init=lr_init
         self.lr_final=lr_final
+        self.decay_from_iter=decay_from_iter  # DashGaussian: delay decay until this iteration
         super(Scheduler, self).__init__(optimizer, last_epoch)
         return
-    
+
     def __helper(self):
         if self.last_epoch < 0 or (self.lr_init == 0.0 and self.lr_final == 0.0):
             # Disable this parameter
             return 0.0
+
+        # DashGaussian strategy: delay decay until decay_from_iter
+        if self.last_epoch < self.decay_from_iter:
+            # Before decay starts, maintain initial learning rate
+            return self.lr_init
+
+        # After decay_from_iter, start exponential decay
         delay_rate = 1.0
-        t = np.clip(self.last_epoch / self.max_epochs, 0, 1)
+        effective_epoch = self.last_epoch - self.decay_from_iter
+        effective_max_epochs = self.max_epochs - self.decay_from_iter
+        t = np.clip(effective_epoch / effective_max_epochs, 0, 1)
         log_lerp = np.exp(np.log(self.lr_init) * (1 - t) + np.log(self.lr_final) * t)
         return delay_rate * log_lerp
 
