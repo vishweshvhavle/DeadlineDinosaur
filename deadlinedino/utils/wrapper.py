@@ -659,7 +659,7 @@ class Binning(BaseWrapper):
     @torch.no_grad()
     def __binning_fused(ndc:torch.Tensor,view_depth:torch.Tensor,inv_cov2d:torch.Tensor,opacity:torch.Tensor,
             img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]):
-        
+
         img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size[0]))),int(math.ceil(img_pixel_shape[1]/float(tile_size[1]))))
         tiles_num=img_tile_shape[0]*img_tile_shape[1]
 
@@ -680,7 +680,17 @@ class Binning(BaseWrapper):
         prefix_sum=depth_sorted_allocate_size.cumsum(1,dtype=torch.int32)#start index of points
         total_tiles_num_batch=prefix_sum[:,-1]
         total_allocate_size=total_tiles_num_batch.max().cpu()
-        
+
+        # Handle case when no primitives are visible (total_allocate_size = 0)
+        # This can happen when all primitives are culled or outside view frustum
+        if total_allocate_size == 0:
+            # Return empty tensors to avoid CUDA kernel launch with invalid configuration
+            batch_size = ndc.shape[0]
+            sorted_tileId = torch.zeros((batch_size, 1), dtype=torch.int32, device=ndc.device)
+            sorted_pointId = torch.zeros((batch_size, 1), dtype=torch.int32, device=ndc.device)
+            tile_start_index = torch.zeros((batch_size, tiles_num + 1), dtype=torch.int32, device=ndc.device)
+            return tile_start_index, sorted_pointId, b_visible.sum(0)
+
         # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
         my_table=litegs_fused.create_table(ndc,inv_cov2d,opacity,prefix_sum,depth_sorted_index,
                                                 int(total_allocate_size),img_pixel_shape[0],img_pixel_shape[1],tile_size[0],tile_size[1])
@@ -693,7 +703,7 @@ class Binning(BaseWrapper):
 
         # range
         tile_start_index=litegs_fused.tileRange(sorted_tileId,int(total_allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
-            
+
         return tile_start_index,sorted_pointId,b_visible.sum(0)
     
     

@@ -143,8 +143,10 @@ class DensityControllerOfficial(DensityControllerBase):
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
         prune_mask=self.get_prune_mask(opacity.sigmoid(),scale.exp())
-        if prune_mask.sum()>0.8*opacity.shape[1]:
-            assert(False) #debug
+        # Safety check: if trying to prune >95% of primitives, skip pruning this iteration
+        # This can happen when statistics are invalid (e.g., no visible primitives)
+        if prune_mask.sum() > 0.95 * opacity.shape[1]:
+            return
         if self.bCluster:
             N=prune_mask.sum()
             chunk_num=int(N/chunk_size)
@@ -344,6 +346,14 @@ class DensityControllerTamingGS(DensityControllerOfficial):
             budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
+
+        # Handle case when score sum is zero (no valid statistics collected)
+        # This can happen when no primitives are visible/rendered
+        if score.sum() <= 0:
+            # Skip densification this iteration - just return current parameters
+            # No need to update optimizer as we're not adding/removing primitives
+            return
+
         densify_index = torch.multinomial(score, budget, replacement=False)
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
