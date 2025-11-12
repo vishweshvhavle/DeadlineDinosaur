@@ -21,19 +21,26 @@ from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
 from .schedule_utils import TrainingScheduler, resize_image_with_scale
+from .. import debug_utils
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
 
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
-    
+
+    # Initialize debugger (set enabled=True to enable debugging)
+    debugger = debug_utils.init_debugger(lp.model_path, enabled=True)
+
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
     if lp.source_type=="colmap":
         cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)#lp.sh_degree,lp.resolution
     elif lp.source_type=="slam":
         cameras_info,camera_frames,init_xyz,init_color=io_manager.load_slam_result(lp.source_path)#lp.sh_degree,lp.resolution
+
+    # Debug: Log initial point cloud statistics
+    debugger.log_pointcloud_init(init_xyz, init_color)
 
     #preload
     for camera_frame in camera_frames:
@@ -62,6 +69,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         init_xyz=torch.tensor(init_xyz,dtype=torch.float32,device='cuda')
         init_color=torch.tensor(init_color,dtype=torch.float32,device='cuda')
         xyz,scale,rot,sh_0,sh_rest,opacity=scene.create_gaussians(init_xyz,init_color,lp.sh_degree)
+
+        # Debug: Log initialized Gaussian parameters
+        debugger.log_gaussian_init(xyz, scale, rot, sh_0, sh_rest, opacity)
+
         if pp.cluster_size:
             xyz,scale,rot,sh_0,sh_rest,opacity=scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
         xyz=torch.nn.Parameter(xyz)
@@ -191,11 +202,22 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                                                                                                xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
                 img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                             actived_sh_degree,gt_image.shape[2:],pp)
-                
+
+                # Debug: Check rendered output
+                debugger.check_render_output(img, current_iteration)
+
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
                 loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
                 loss+=(culled_scale).square().mean()*op.reg_weight
+
+                # Debug: Log training iteration statistics
+                debugger.log_training_iteration(current_iteration, xyz, scale, rot, sh_0, sh_rest, opacity,
+                                              img, gt_image, loss, l1_loss, ssim_loss)
+
+                # Debug: Save comparison images
+                debugger.save_comparison_image(current_iteration, img, gt_image, prefix="train")
+
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
