@@ -162,6 +162,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 # Apply progressive resolution scaling
                 if current_render_scale > 1:
                     gt_image = resize_image_with_scale(gt_image, current_render_scale)
+                    # CRITICAL: Adjust projection matrix focal lengths for the new resolution
+                    # Focal length must scale proportionally with image dimensions
+                    proj_matrix[:, 0, 0] = proj_matrix[:, 0, 0] / current_render_scale
+                    proj_matrix[:, 1, 1] = proj_matrix[:, 1, 1] / current_render_scale
+
                 if op.learnable_viewproj:
                     #fix view matrix
                     view_param_vec=view_params(idx.cuda())
@@ -174,6 +179,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     #fix proj matrix
                     focal_x=camera_focal_params
                     focal_y=camera_focal_params*gt_image.shape[3]/gt_image.shape[2]
+                    # Scale focal lengths for progressive resolution
+                    if current_render_scale > 1:
+                        focal_x = focal_x / current_render_scale
+                        focal_y = focal_y / current_render_scale
                     proj_matrix[:,0,0]=focal_x
                     proj_matrix[:,1,1]=focal_y
 
