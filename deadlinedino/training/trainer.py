@@ -170,11 +170,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
 
-                # Store original GT image and dimensions for loss computation at full resolution
-                original_gt_image = gt_image
-                original_height, original_width = gt_image.shape[2], gt_image.shape[3]
-
-                # Apply progressive resolution scaling
+                # Apply progressive resolution scaling (DashGaussian approach)
+                # Render AND compute loss at downscaled resolution for gradient consistency
                 if current_render_scale > 1:
                     gt_image = resize_image_with_scale(gt_image, current_render_scale)
                     # CRITICAL: Create a copy of projection matrix to avoid in-place modification
@@ -216,33 +213,24 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                             actived_sh_degree,gt_image.shape[2:],pp)
 
-                # CRITICAL FIX: Upscale rendered image back to original resolution for loss computation
-                # This ensures gradients propagate through full-resolution images, not downscaled ones
-                # Without this, the optimizer receives low-res gradient signals, causing NaN opacities
-                if current_render_scale > 1:
-                    img = torch.nn.functional.interpolate(
-                        img,
-                        size=(original_height, original_width),
-                        mode='bilinear',
-                        align_corners=False,
-                        antialias=True
-                    )
-
                 # Debug: Check rendered output
                 debugger.check_render_output(img, current_iteration)
 
-                # Compute loss at full resolution with original GT image
-                l1_loss=__l1_loss(img,original_gt_image)
-                ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,original_gt_image)
+                # CRITICAL: Compute loss at DOWNSCALED resolution (DashGaussian approach)
+                # This ensures gradients match the rendering resolution, avoiding gradient scaling mismatches
+                # that cause NaN opacities during resolution transitions.
+                # Unlike upscaling approaches, this keeps gradient flow consistent with render resolution.
+                l1_loss=__l1_loss(img,gt_image)
+                ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
                 loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
                 loss+=(culled_scale).square().mean()*op.reg_weight
 
                 # Debug: Log training iteration statistics
                 debugger.log_training_iteration(current_iteration, xyz, scale, rot, sh_0, sh_rest, opacity,
-                                              img, original_gt_image, loss, l1_loss, ssim_loss)
+                                              img, gt_image, loss, l1_loss, ssim_loss)
 
                 # Debug: Save comparison images
-                debugger.save_comparison_image(current_iteration, img, original_gt_image, prefix="train")
+                debugger.save_comparison_image(current_iteration, img, gt_image, prefix="train")
 
                 loss.backward()
                 if StatisticsHelperInst.bStart:
