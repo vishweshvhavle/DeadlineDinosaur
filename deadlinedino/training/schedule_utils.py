@@ -24,6 +24,10 @@ class TrainingScheduler:
             original_images: List of original training images for significance calculation
             total_iterations: Total training iterations
         """
+        # Safety checks
+        assert total_iterations > 0, "Total iterations must be positive"
+        assert init_n_gaussian > 0, "Initial Gaussian count must be positive"
+
         self.opt = opt
         self.pipe = pipe
         self.total_iterations = total_iterations
@@ -36,14 +40,23 @@ class TrainingScheduler:
 
         # Primitive scheduling parameters
         self.init_n_gaussian = init_n_gaussian
-        self.max_n_gaussian = pipe.target_primitives if hasattr(pipe, 'target_primitives') and pipe.target_primitives else (init_n_gaussian * 6)
 
-        # Momentum tracking for primitive growth
-        self.momentum = -1 if (hasattr(pipe, 'target_primitives') and pipe.target_primitives) else 5 * init_n_gaussian
-        self.integrate_factor = 0.98  # Smoothing factor for momentum
+        # Initialize momentum and max_n_gaussian based on mode
+        if hasattr(pipe, 'target_primitives') and pipe.target_primitives:
+            # Fixed mode: target is specified
+            self.max_n_gaussian = pipe.target_primitives
+            self.momentum = -1
+            print(f"[SCHEDULER] Fixed mode: target={self.max_n_gaussian} primitives")
+        else:
+            # Dynamic mode: use momentum-based growth
+            self.momentum = 5 * init_n_gaussian
+            self.max_n_gaussian = init_n_gaussian + self.momentum
+            print(f"[SCHEDULER] Dynamic mode: Pfin_init={self.max_n_gaussian} primitives (5x init)")
 
-        # Max densify rate per step
-        self.max_densify_rate_per_step = 0.2
+        self.integrate_factor = 0.98  # Smoothing factor for momentum (γ in Eq. 5)
+
+        # Max densify rate per step (prevent explosive growth)
+        self.max_densify_rate_per_step = 0.2  # Max 20% of init count per step
 
         # Calculate resolution schedule based on image significance
         self.init_reso_scheduler(original_images)
@@ -181,8 +194,12 @@ class TrainingScheduler:
         """
         Calculate the densification rate synchronized with resolution.
 
-        Primitives should grow proportionally with resolution to avoid
-        wasteful densification at low resolutions.
+        DashGaussian Eq. 4: Pi = Pinit + (Pfin - Pinit) / r^(2-i/S)
+
+        Key principles:
+        1. Power factor decreases from 2→1 as training progresses
+        2. At low resolution (large r), growth is suppressed by r^power
+        3. At high resolution (r=1), growth approaches Pfin linearly
 
         Args:
             iteration: Current training iteration
@@ -192,39 +209,60 @@ class TrainingScheduler:
         Returns:
             float: Densification rate (fraction of init_n_gaussian to add)
         """
-        # Calculate target primitive count at current resolution
-        # Lower resolution needs fewer primitives
-        resolution_factor = (self.max_reso_scale / render_scale) ** 2
-        target_at_resolution = self.init_n_gaussian + (self.max_n_gaussian - self.init_n_gaussian) * (resolution_factor / (self.max_reso_scale ** 2))
+        # Safety: avoid division by zero if render_scale is invalid
+        if render_scale < 1.0:
+            render_scale = 1.0
 
-        # Calculate how many primitives we need to add
-        target_add = target_at_resolution - current_n_primitives
+        # Calculate training progress (0.0 at start, 1.0 at end)
+        progress = min(iteration / self.total_iterations, 1.0)
 
-        # Update momentum (exponential moving average)
-        if self.momentum < 0:
-            # First time: initialize
-            self.momentum = max(target_add, 0)
-        else:
-            # Smooth update
-            self.momentum = self.integrate_factor * self.momentum + (1 - self.integrate_factor) * max(target_add, 0)
+        # Power factor: 2.0 → 1.0 (suppresses early growth, encourages late growth)
+        power_factor = 2.0 - progress
 
-        # Calculate densify rate based on momentum
-        densify_rate = self.momentum / self.init_n_gaussian
+        # DashGaussian formula
+        denominator = render_scale ** power_factor
+        target_n_primitives = self.init_n_gaussian + (self.max_n_gaussian - self.init_n_gaussian) / denominator
 
-        # Clamp to reasonable limits
-        densify_rate = min(densify_rate, self.max_densify_rate_per_step)
-        densify_rate = max(densify_rate, 0.0)
+        # How many primitives should we add THIS step?
+        target_add = max(target_n_primitives - current_n_primitives, 0)
+
+        # Express as rate (fraction of initial count)
+        densify_rate = target_add / self.init_n_gaussian
+
+        # Clamp to avoid explosive growth
+        densify_rate = min(densify_rate, self.max_densify_rate_per_step)  # Default 0.2 = 20%
+
+        # Debug logging (every 100 iterations)
+        if iteration % 100 == 0:
+            print(f"[DENSIFY] iter={iteration}, scale={render_scale}, power={power_factor:.2f}, "
+                  f"target={target_n_primitives:.0f}, current={current_n_primitives}, rate={densify_rate:.3f}")
 
         return densify_rate
 
     def update_momentum(self, momentum_add):
         """
-        Manually update momentum (called after densification).
+        Update momentum using DashGaussian Eq. 5: Pfin = max(Pfin, γ·Pfin + η·Padd)
 
         Args:
-            momentum_add: Amount to add to momentum
+            momentum_add: Number of primitives naturally added this step
         """
-        self.momentum += momentum_add
+        if self.momentum == -1:  # Fixed max mode
+            return
+
+        if momentum_add is None or momentum_add == 0:
+            return
+
+        # Equation 5 from DashGaussian paper
+        gamma = self.integrate_factor  # 0.98
+        eta = 1.0
+
+        new_momentum = gamma * self.momentum + eta * momentum_add
+        self.momentum = max(self.momentum, new_momentum)
+
+        # Update final target
+        self.max_n_gaussian = self.init_n_gaussian + self.momentum
+
+        print(f"[MOMENTUM] Updated: Pfin={self.max_n_gaussian:.0f} (momentum={self.momentum:.0f}, added={momentum_add})")
 
     def should_start_xyz_decay(self, iteration):
         """

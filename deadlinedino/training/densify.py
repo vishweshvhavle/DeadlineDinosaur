@@ -243,10 +243,15 @@ class DensityControllerOfficial(DensityControllerBase):
                       "sh_0": append_sh_0,
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
-        
+
+        # Count actual primitives added
+        total_added = append_xyz.shape[-1]
+        if append_xyz.ndim > 1:
+            total_added = append_xyz.shape[-2] * append_xyz.shape[-1]  # Handle clustered case
+
         #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_mask.sum().cpu(),split_mask.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
+        return total_added
     
     @torch.no_grad()
     def reset_opacity(self,optimizer:torch.optim.Optimizer,epoch:int):
@@ -280,7 +285,13 @@ class DensityControllerOfficial(DensityControllerBase):
                 if scheduler is not None and current_iteration is not None and current_n_primitives is not None and current_render_scale is not None:
                     densify_rate = scheduler.get_densify_rate(current_iteration, current_n_primitives, current_render_scale)
 
-                self.split_and_clone(optimizer,epoch,densify_rate=densify_rate)
+                # Perform densification and capture the count of added primitives
+                momentum_add = self.split_and_clone(optimizer,epoch,densify_rate=densify_rate)
+
+                # Update momentum (Eq. 5 in DashGaussian paper)
+                if scheduler is not None and momentum_add is not None:
+                    scheduler.update_momentum(momentum_add)
+
                 self.prune(optimizer,epoch)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -350,11 +361,23 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         # Handle case when score sum is zero (no valid statistics collected)
         # This can happen when no primitives are visible/rendered
         if score.sum() <= 0:
-            # Skip densification this iteration - just return current parameters
-            # No need to update optimizer as we're not adding/removing primitives
-            return
+            print(f"[WARNING] Zero score sum at epoch {epoch}, skipping densification")
+            return 0  # Return 0 instead of None!
 
-        densify_index = torch.multinomial(score, budget, replacement=False)
+        # Handle case when budget exceeds available candidates
+        max_budget = score.shape[0]
+        if budget > max_budget:
+            print(f"[WARNING] Budget {budget} exceeds candidates {max_budget}, clamping")
+            budget = max_budget
+
+        if budget <= 0:
+            return 0
+
+        try:
+            densify_index = torch.multinomial(score, budget, replacement=False)
+        except RuntimeError as e:
+            print(f"[ERROR] Multinomial sampling failed: {e}")
+            return 0
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
 
@@ -406,8 +429,14 @@ class DensityControllerTamingGS(DensityControllerOfficial):
                       "sh_0": append_sh_0,
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
-        
-        #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_index.sum().cpu(),split_index.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
+
+        # Count actual primitives added
+        num_cloned = clone_index.shape[0]
+        num_split = split_index.shape[0]
+        total_added = num_cloned + num_split
+
+        print(f"[DENSIFY] Epoch {epoch}: Added {total_added} ({num_cloned} cloned, {num_split} split)")
+
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
+        return total_added  # Return actual count
     
