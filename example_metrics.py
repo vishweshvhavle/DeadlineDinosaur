@@ -140,10 +140,13 @@ if __name__ == "__main__":
                                                                                                         xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
                 img,transmitance,depth,normal,_=deadlinedino.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                             lp.sh_degree,gt_image.shape[2:],pp)
+                # Clamp rendered image to valid range [0, 1]
+                img = img.clamp(0, 1)
                 psnr_value=psnr_metrics(img,gt_image)
                 ssim_list.append(ssim_metrics(img,gt_image).unsqueeze(0))
                 psnr_list.append(psnr_value.unsqueeze(0))
-                lpips_list.append(lpip_metrics(img,gt_image).unsqueeze(0))
+                # LPIPS expects images in [-1, 1] range, convert from [0, 1]
+                lpips_list.append(lpip_metrics(img * 2 - 1, gt_image * 2 - 1).unsqueeze(0))
                 if OUTPUT_FILE:
                     plt.imsave(os.path.join(lp.model_path,loader_name,"{}-{:.2f}-rd.png".format(index,float(psnr_value))),img.detach().cpu()[0].permute(1,2,0).numpy())
                     plt.imsave(os.path.join(lp.model_path,loader_name,"{}-{:.2f}-gt.png".format(index,float(psnr_value))),gt_image.detach().cpu()[0].permute(1,2,0).numpy())
