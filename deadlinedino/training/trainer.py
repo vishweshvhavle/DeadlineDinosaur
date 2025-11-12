@@ -170,9 +170,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
 
+                # Store original resolution for loss computation
+                original_resolution = gt_image.shape[2:]
+
                 # Apply progressive resolution scaling
+                # DashGaussian strategy: render at low res, then upscale to original for loss
+                render_resolution = original_resolution
                 if current_render_scale > 1:
-                    gt_image = resize_image_with_scale(gt_image, current_render_scale)
+                    # Calculate target render resolution (downscaled)
+                    render_resolution = (
+                        int(original_resolution[0] / current_render_scale),
+                        int(original_resolution[1] / current_render_scale)
+                    )
                     # CRITICAL: Create a copy of projection matrix to avoid in-place modification
                     # of the shared tensor from the dataset. Otherwise, the projection matrix
                     # gets divided multiple times as views are reused across epochs.
@@ -198,7 +207,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
                     #fix proj matrix
                     focal_x=camera_focal_params
-                    focal_y=camera_focal_params*gt_image.shape[3]/gt_image.shape[2]
+                    focal_y=camera_focal_params*original_resolution[1]/original_resolution[0]
                     # Scale focal lengths for progressive resolution
                     if current_render_scale > 1:
                         focal_x = focal_x / current_render_scale
@@ -209,23 +218,40 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 #cluster culling
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
                                                                                                                xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
+                # Render at the (potentially downscaled) resolution
                 img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
-                                                            actived_sh_degree,gt_image.shape[2:],pp)
+                                                            actived_sh_degree,render_resolution,pp)
 
                 # Debug: Check rendered output
                 debugger.check_render_output(img, current_iteration)
 
-                l1_loss=__l1_loss(img,gt_image)
-                ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
+                # CRITICAL FIX: Upscale rendered image back to original resolution before computing loss
+                # This ensures gradients are computed in full-resolution space, providing better
+                # gradient signal and avoiding numerical instability at very low resolutions
+                if current_render_scale > 1:
+                    # Upscale using the inverse scale factor
+                    img_upscaled = torch.nn.functional.interpolate(
+                        img,
+                        size=original_resolution,
+                        mode='bilinear',
+                        align_corners=False,
+                        antialias=True
+                    )
+                else:
+                    img_upscaled = img
+
+                # Compute loss at ORIGINAL resolution (not downscaled)
+                l1_loss=__l1_loss(img_upscaled,gt_image)
+                ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img_upscaled,gt_image)
                 loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
                 loss+=(culled_scale).square().mean()*op.reg_weight
 
-                # Debug: Log training iteration statistics
+                # Debug: Log training iteration statistics (use upscaled image for comparison)
                 debugger.log_training_iteration(current_iteration, xyz, scale, rot, sh_0, sh_rest, opacity,
-                                              img, gt_image, loss, l1_loss, ssim_loss)
+                                              img_upscaled, gt_image, loss, l1_loss, ssim_loss)
 
-                # Debug: Save comparison images
-                debugger.save_comparison_image(current_iteration, img, gt_image, prefix="train")
+                # Debug: Save comparison images (use upscaled image for comparison)
+                debugger.save_comparison_image(current_iteration, img_upscaled, gt_image, prefix="train")
 
                 loss.backward()
                 if StatisticsHelperInst.bStart:
