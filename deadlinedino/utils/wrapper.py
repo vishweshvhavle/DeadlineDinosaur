@@ -681,15 +681,10 @@ class Binning(BaseWrapper):
         total_tiles_num_batch=prefix_sum[:,-1]
         total_allocate_size=total_tiles_num_batch.max().cpu()
 
-        # Handle case when no primitives are visible (total_allocate_size = 0)
-        # This can happen when all primitives are culled or outside view frustum
+        # Ensure minimum allocate size of 1 to avoid CUDA kernel issues
+        # If no primitives are visible, the rasterizer will naturally produce empty output
         if total_allocate_size == 0:
-            # Return empty tensors to avoid CUDA kernel launch with invalid configuration
-            batch_size = ndc.shape[0]
-            sorted_tileId = torch.zeros((batch_size, 1), dtype=torch.int32, device=ndc.device)
-            sorted_pointId = torch.zeros((batch_size, 1), dtype=torch.int32, device=ndc.device)
-            tile_start_index = torch.zeros((batch_size, tiles_num + 1), dtype=torch.int32, device=ndc.device)
-            return tile_start_index, sorted_pointId, b_visible.sum(0)
+            total_allocate_size = 1
 
         # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
         my_table=litegs_fused.create_table(ndc,inv_cov2d,opacity,prefix_sum,depth_sorted_index,
