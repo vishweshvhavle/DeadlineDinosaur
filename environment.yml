@@ -1,0 +1,30 @@
+name: DDinoGS
+channels:
+  - nvidia/label/cuda-12.1.0
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip=24.0
+  - cuda-toolkit=12.1
+  - plyfile
+  - tqdm
+  - pip:
+    - torch==2.3.1
+    - torchvision==0.18.1
+    - torchaudio==2.3.1
+    - certifi==2025.10.5
+    - charset-normalizer==3.4.4
+    - idna==3.11
+    - joblib==1.5.2
+    - matplotlib==3.9.4
+    - natsort==8.4.0
+    - numpy==1.26.4
+    - opencv-python==4.11.0.86
+    - requests==2.32.5
+    - typing-extensions==4.12.2
+    - urllib3==2.5.0
+    - pandas==2.2.3
+    - pillow==10.4.0
+    - torchmetrics==1.4.0
+    - lpips==0.1.4
