@@ -117,7 +117,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     # Validation logging
     print(f"[INIT] Starting with {init_n_gaussian} primitives")
     print(f"[INIT] Target primitives: {dp.target_primitives if dp.target_primitives > 0 else 'dynamic'}")
-    print(f"[INIT] Densify from {dp.densify_from_iter} to {dp.densify_until}")
+    print(f"[INIT] Densify from {dp.densify_from} to {dp.densify_until}")
     print(f"[INIT] Densification interval: {dp.densification_interval}")
 
     training_scheduler = TrainingScheduler(

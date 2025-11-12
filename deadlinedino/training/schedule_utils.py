@@ -42,9 +42,9 @@ class TrainingScheduler:
         self.init_n_gaussian = init_n_gaussian
 
         # Parameters needed for rate calculation (from DensifyParams)
-        self.densify_until = opt.densify_until_iter
+        self.densify_until = opt.densify_until
         self.densification_interval = opt.densification_interval
-        self.densify_from = opt.densify_from_iter
+        self.densify_from = opt.densify_from
 
         # Initialize momentum and max_n_gaussian based on mode
         if hasattr(pipe, 'target_primitives') and pipe.target_primitives:
