@@ -66,7 +66,23 @@ if __name__ == "__main__":
     norm_trans,norm_radius=trainingset.get_norm()
 
     #model
-    xyz,scale,rot,sh_0,sh_rest,opacity=deadlinedino.io_manager.load_ply(os.path.join(lp.model_path,"point_cloud","finish","point_cloud.ply"),lp.sh_degree)
+    # Check for timeout checkpoint first, otherwise use finish directory
+    point_cloud_dir = os.path.join(lp.model_path, "point_cloud")
+    ply_path = None
+
+    # Look for timeout_epoch directories
+    if os.path.exists(point_cloud_dir):
+        timeout_dirs = [d for d in os.listdir(point_cloud_dir) if d.startswith("timeout_epoch_")]
+        if timeout_dirs:
+            # Use the timeout checkpoint with the highest epoch number
+            timeout_dirs.sort(key=lambda x: int(x.split("_")[-1]), reverse=True)
+            ply_path = os.path.join(point_cloud_dir, timeout_dirs[0], "point_cloud.ply")
+
+    # Fall back to finish directory if no timeout checkpoint found
+    if ply_path is None or not os.path.exists(ply_path):
+        ply_path = os.path.join(point_cloud_dir, "finish", "point_cloud.ply")
+
+    xyz,scale,rot,sh_0,sh_rest,opacity=deadlinedino.io_manager.load_ply(ply_path,lp.sh_degree)
     xyz=torch.Tensor(xyz).cuda()
     scale=torch.Tensor(scale).cuda()
     rot=torch.Tensor(rot).cuda()
@@ -80,7 +96,9 @@ if __name__ == "__main__":
         xyz,scale,rot,sh_0,sh_rest,opacity=deadlinedino.scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
         cluster_origin,cluster_extend=deadlinedino.scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
     if op.learnable_viewproj:
-        view_params,proj_parmas=torch.load(os.path.join(lp.model_path,"point_cloud","finish","viewproj.pth"))
+        # Use the same directory as the ply file for viewproj.pth
+        viewproj_path = os.path.join(os.path.dirname(ply_path), "viewproj.pth")
+        view_params,proj_parmas=torch.load(viewproj_path)
         qvec=torch.nn.functional.normalize(view_params[:,:4],dim=1)
         rot_matrix=deadlinedino.utils.wrapper.CreateTransformMatrix.call_fused(torch.ones((3,qvec.shape[0]),device='cuda'),qvec.transpose(0,1).contiguous()).permute(2,0,1)
         tvec=view_params[:,4:]

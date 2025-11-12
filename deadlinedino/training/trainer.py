@@ -99,6 +99,29 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     training_start_time = time.time()
 
     for epoch in range(start_epoch,total_epoch):
+        # Check if training time has exceeded 59.5 seconds BEFORE starting the epoch
+        # This ensures we don't overshoot by running another full epoch
+        elapsed_time = time.time() - training_start_time
+        if elapsed_time >= 59.5:
+            progress_bar.close()
+            print(f"Training stopped at {elapsed_time:.2f}s (target: 59.5s) at epoch {epoch}")
+
+            # Save the most recent .ply file
+            save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
+
+            if pp.cluster_size:
+                tensors = scene.cluster.uncluster(xyz, scale, rot, sh_0, sh_rest, opacity)
+            else:
+                tensors = xyz, scale, rot, sh_0, sh_rest, opacity
+            param_nyp = []
+            for tensor in tensors:
+                param_nyp.append(tensor.detach().cpu().numpy())
+            io_manager.save_ply(os.path.join(save_path, "point_cloud.ply"), *param_nyp)
+            if op.learnable_viewproj:
+                torch.save(list(view_params.parameters())+[camera_focal_params], os.path.join(save_path, "viewproj.pth"))
+
+            print(f"Saved checkpoint to {save_path}")
+            break
 
         with torch.no_grad():
             if pp.cluster_size>0 and (epoch-1)%dp.densification_interval==0:
@@ -193,29 +216,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
         progress_bar.update()
-
-        # Check if training time has exceeded 59.5 seconds
-        elapsed_time = time.time() - training_start_time
-        if elapsed_time >= 59.5:
-            progress_bar.close()
-            print(f"Training stopped at {elapsed_time:.2f}s (target: 59.5s) at epoch {epoch}")
-
-            # Save the most recent .ply file
-            save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
-
-            if pp.cluster_size:
-                tensors = scene.cluster.uncluster(xyz, scale, rot, sh_0, sh_rest, opacity)
-            else:
-                tensors = xyz, scale, rot, sh_0, sh_rest, opacity
-            param_nyp = []
-            for tensor in tensors:
-                param_nyp.append(tensor.detach().cpu().numpy())
-            io_manager.save_ply(os.path.join(save_path, "point_cloud.ply"), *param_nyp)
-            if op.learnable_viewproj:
-                torch.save(list(view_params.parameters())+[camera_focal_params], os.path.join(save_path, "viewproj.pth"))
-
-            print(f"Saved checkpoint to {save_path}")
-            break
 
         if epoch in save_ply or epoch==total_epoch-1:
             if epoch==total_epoch-1:
