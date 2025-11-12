@@ -234,11 +234,14 @@ at::Tensor tileRange(at::Tensor table_tileId, int64_t table_length, int64_t max_
     auto opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(table_tileId.device()).requires_grad(false);
     auto out = torch::ones(output_shape, opt)*-1;
 
-    dim3 Block3d(std::ceil(table_length / 512.0f), view_num, 1);
+    // Skip kernel launch if table_length or view_num is 0 to avoid invalid CUDA configuration
+    if (table_length > 0 && view_num > 0) {
+        dim3 Block3d(std::ceil(table_length / 512.0f), view_num, 1);
 
-    tile_range_kernel<<<Block3d, 512 >>>
-        (table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(), table_length, max_tileId, out.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
-    CUDA_CHECK_ERRORS;
+        tile_range_kernel<<<Block3d, 512 >>>
+            (table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(), table_length, max_tileId, out.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
+        CUDA_CHECK_ERRORS;
+    }
 
     return out;
 }
