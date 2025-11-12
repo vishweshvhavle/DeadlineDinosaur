@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import math
 import os
+import time
 import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 
@@ -93,6 +94,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
+
+    # Time-based stopping: track start time for 59.5 second timeout
+    training_start_time = time.time()
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -188,7 +192,30 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
 
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
-        progress_bar.update()  
+        progress_bar.update()
+
+        # Check if training time has exceeded 59.5 seconds
+        elapsed_time = time.time() - training_start_time
+        if elapsed_time >= 59.5:
+            progress_bar.close()
+            print(f"Training stopped at {elapsed_time:.2f}s (target: 59.5s) at epoch {epoch}")
+
+            # Save the most recent .ply file
+            save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
+
+            if pp.cluster_size:
+                tensors = scene.cluster.uncluster(xyz, scale, rot, sh_0, sh_rest, opacity)
+            else:
+                tensors = xyz, scale, rot, sh_0, sh_rest, opacity
+            param_nyp = []
+            for tensor in tensors:
+                param_nyp.append(tensor.detach().cpu().numpy())
+            io_manager.save_ply(os.path.join(save_path, "point_cloud.ply"), *param_nyp)
+            if op.learnable_viewproj:
+                torch.save(list(view_params.parameters())+[camera_focal_params], os.path.join(save_path, "viewproj.pth"))
+
+            print(f"Saved checkpoint to {save_path}")
+            break
 
         if epoch in save_ply or epoch==total_epoch-1:
             if epoch==total_epoch-1:
