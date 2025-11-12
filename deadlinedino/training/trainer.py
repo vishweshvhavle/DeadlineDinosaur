@@ -20,6 +20,7 @@ from .. import render
 from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
+from .schedule_utils import TrainingScheduler, resize_image_with_scale
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
@@ -95,6 +96,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
 
+    # Initialize progressive training scheduler (DashGaussian strategy)
+    # Collect original images for significance calculation
+    original_images = [frame.load_image(lp.resolution) for frame in trainingset.frames]
+    training_scheduler = TrainingScheduler(
+        op, dp,
+        init_n_gaussian=xyz.shape[-2] if pp.cluster_size == 0 else (xyz.shape[-2] * xyz.shape[-1]),
+        original_images=original_images,
+        total_iterations=op.iterations
+    )
+    current_render_scale = training_scheduler.max_reso_scale  # Start with lowest resolution
+
     # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
 
@@ -132,10 +144,24 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         with StatisticsHelperInst.try_start(epoch):
             for view_matrix,proj_matrix,frustumplane,gt_image,idx in train_loader:
+                # Update resolution scale based on current iteration
+                current_iteration = epoch * len(train_loader) + idx.item()
+                current_render_scale = training_scheduler.get_res_scale(current_iteration)
+
+                # Update optimizer scheduler to delay xyz LR decay until max resolution (DashGaussian)
+                if training_scheduler.max_resolution_reached and schedular.decay_from_iter == 0:
+                    schedular.decay_from_iter = training_scheduler.max_resolution_iter
+                    print(f"\n[DashGaussian] Max resolution reached at iteration {training_scheduler.max_resolution_iter}")
+                    print(f"[DashGaussian] XYZ learning rate decay will start from this point")
+
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
+
+                # Apply progressive resolution scaling
+                if current_render_scale > 1:
+                    gt_image = resize_image_with_scale(gt_image, current_render_scale)
                 if op.learnable_viewproj:
                     #fix view matrix
                     view_param_vec=view_params(idx.cuda())
@@ -214,7 +240,16 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
 
-        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
+        # Pass scheduler information to density controller for progressive densification
+        current_iter = epoch * len(train_loader)
+        current_n_primitives = xyz.shape[-2] if pp.cluster_size == 0 else (xyz.shape[-2] * xyz.shape[-1])
+        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(
+            opt, epoch,
+            scheduler=training_scheduler,
+            current_iteration=current_iter,
+            current_n_primitives=current_n_primitives,
+            current_render_scale=current_render_scale
+        )
         progress_bar.update()
 
         if epoch in save_ply or epoch==total_epoch-1:
