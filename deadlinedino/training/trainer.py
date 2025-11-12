@@ -110,12 +110,34 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     # Initialize progressive training scheduler (DashGaussian strategy)
     # Collect original images for significance calculation
     original_images = [frame.load_image(lp.resolution) for frame in trainingset.frames]
+
+    # Calculate initial primitive count
+    init_n_gaussian = xyz.shape[-2] if pp.cluster_size == 0 else (xyz.shape[-2] * xyz.shape[-1])
+
+    # Validation logging
+    print(f"[INIT] Starting with {init_n_gaussian} primitives")
+    print(f"[INIT] Target primitives: {dp.target_primitives if dp.target_primitives > 0 else 'dynamic'}")
+    print(f"[INIT] Densify from {dp.densify_from_iter} to {dp.densify_until}")
+    print(f"[INIT] Densification interval: {dp.densification_interval}")
+
     training_scheduler = TrainingScheduler(
         op, dp,
-        init_n_gaussian=xyz.shape[-2] if pp.cluster_size == 0 else (xyz.shape[-2] * xyz.shape[-1]),
+        init_n_gaussian=init_n_gaussian,
         original_images=original_images,
         total_iterations=op.iterations
     )
+
+    # Validate scheduler state
+    assert training_scheduler.init_n_gaussian > 0, "Invalid initial gaussian count"
+    assert training_scheduler.total_iterations > 0, "Invalid total iterations"
+    assert training_scheduler.max_n_gaussian >= training_scheduler.init_n_gaussian, "Invalid max gaussians"
+    assert training_scheduler.densify_until > 0, "Invalid densify_until"
+    assert training_scheduler.densification_interval > 0, "Invalid densification_interval"
+
+    print(f"[SCHEDULER] Initialized: Pinit={training_scheduler.init_n_gaussian}, "
+          f"Pfin={training_scheduler.max_n_gaussian}, "
+          f"resolution_schedule={len(training_scheduler.resolution_schedule)} steps")
+
     current_render_scale = training_scheduler.max_reso_scale  # Start with lowest resolution
 
     # Time-based stopping: track start time for 59.5 second timeout

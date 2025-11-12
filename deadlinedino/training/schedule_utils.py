@@ -41,6 +41,11 @@ class TrainingScheduler:
         # Primitive scheduling parameters
         self.init_n_gaussian = init_n_gaussian
 
+        # Parameters needed for rate calculation (from DensifyParams)
+        self.densify_until = opt.densify_until_iter
+        self.densification_interval = opt.densification_interval
+        self.densify_from = opt.densify_from_iter
+
         # Initialize momentum and max_n_gaussian based on mode
         if hasattr(pipe, 'target_primitives') and pipe.target_primitives:
             # Fixed mode: target is specified
@@ -192,7 +197,8 @@ class TrainingScheduler:
 
     def get_densify_rate(self, iteration, current_n_primitives, render_scale):
         """
-        Calculate the densification rate synchronized with resolution.
+        Calculate densification rate synchronized with resolution.
+        FIXED VERSION - Smooths growth over remaining steps.
 
         DashGaussian Eq. 4: Pi = Pinit + (Pfin - Pinit) / r^(2-i/S)
 
@@ -200,6 +206,7 @@ class TrainingScheduler:
         1. Power factor decreases from 2→1 as training progresses
         2. At low resolution (large r), growth is suppressed by r^power
         3. At high resolution (r=1), growth approaches Pfin linearly
+        4. Growth is SMOOTHED over remaining densification steps (not all at once!)
 
         Args:
             iteration: Current training iteration
@@ -207,7 +214,7 @@ class TrainingScheduler:
             render_scale: Current rendering resolution scale
 
         Returns:
-            float: Densification rate (fraction of init_n_gaussian to add)
+            float: Densification rate (fraction of init_n_gaussian to add per step)
         """
         # Safety: avoid division by zero if render_scale is invalid
         if render_scale < 1.0:
@@ -219,23 +226,34 @@ class TrainingScheduler:
         # Power factor: 2.0 → 1.0 (suppresses early growth, encourages late growth)
         power_factor = 2.0 - progress
 
-        # DashGaussian formula
+        # DashGaussian formula for TARGET primitive count
         denominator = render_scale ** power_factor
         target_n_primitives = self.init_n_gaussian + (self.max_n_gaussian - self.init_n_gaussian) / denominator
 
-        # How many primitives should we add THIS step?
-        target_add = max(target_n_primitives - current_n_primitives, 0)
+        # CRITICAL FIX: Smooth the growth over remaining densification steps
+        remaining_iters = self.densify_until - iteration
+        if remaining_iters <= 0:
+            return 0.0
 
-        # Express as rate (fraction of initial count)
-        densify_rate = target_add / self.init_n_gaussian
+        # Calculate how many densification steps remain
+        remaining_steps = max(1, remaining_iters // self.densification_interval)
 
-        # Clamp to avoid explosive growth
-        densify_rate = min(densify_rate, self.max_densify_rate_per_step)  # Default 0.2 = 20%
+        # Spread the growth over remaining steps (NOT all at once!)
+        total_to_add = max(0, target_n_primitives - current_n_primitives)
+        per_step_add = total_to_add / remaining_steps
+
+        # Convert to rate (fraction of initial count)
+        densify_rate = per_step_add / self.init_n_gaussian
+
+        # Clamp to prevent explosive growth
+        densify_rate = max(0, min(densify_rate, self.max_densify_rate_per_step))
 
         # Debug logging (every 100 iterations)
         if iteration % 100 == 0:
-            print(f"[DENSIFY] iter={iteration}, scale={render_scale}, power={power_factor:.2f}, "
-                  f"target={target_n_primitives:.0f}, current={current_n_primitives}, rate={densify_rate:.3f}")
+            print(f"[DENSIFY] iter={iteration}, scale={render_scale:.0f}, "
+                  f"power={power_factor:.2f}, target={target_n_primitives:.0f}, "
+                  f"current={current_n_primitives}, per_step={per_step_add:.0f}, "
+                  f"rate={densify_rate:.3f}, remaining_steps={remaining_steps}")
 
         return densify_rate
 
