@@ -173,12 +173,21 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 # Apply progressive resolution scaling
                 if current_render_scale > 1:
                     gt_image = resize_image_with_scale(gt_image, current_render_scale)
-                    # CRITICAL: Adjust projection matrix focal lengths for the new resolution
+                    # CRITICAL: Create a copy of projection matrix to avoid in-place modification
+                    # of the shared tensor from the dataset. Otherwise, the projection matrix
+                    # gets divided multiple times as views are reused across epochs.
+                    proj_matrix = proj_matrix.clone()
+                    # Adjust projection matrix focal lengths for the new resolution
                     # Focal length must scale proportionally with image dimensions
                     proj_matrix[:, 0, 0] = proj_matrix[:, 0, 0] / current_render_scale
                     proj_matrix[:, 1, 1] = proj_matrix[:, 1, 1] / current_render_scale
 
                 if op.learnable_viewproj:
+                    # Create copies to avoid modifying shared dataset tensors
+                    view_matrix = view_matrix.clone()
+                    if current_render_scale == 1:  # Already cloned above if > 1
+                        proj_matrix = proj_matrix.clone()
+
                     #fix view matrix
                     view_param_vec=view_params(idx.cuda())
                     qvec=torch.nn.functional.normalize(view_param_vec[:,:4],dim=1)
@@ -252,6 +261,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         gt_image=gt_image.cuda()/255.0
 
                         if name=="Trainingset" and op.learnable_viewproj:
+                            # Create copies to avoid modifying shared dataset tensors
+                            view_matrix = view_matrix.clone()
+                            proj_matrix = proj_matrix.clone()
+
                             view_param_vec=view_params(idx.cuda())
                             qvec=torch.nn.functional.normalize(view_param_vec[:,:4],dim=1)
                             tvec=view_param_vec[:,4:]
