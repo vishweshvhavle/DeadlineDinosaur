@@ -21,12 +21,14 @@ from .. import render
 from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
+from .scheduling_utils import ResolutionScheduler
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
 
-def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_resolution):
-    """Save debug visualization with render and GT side by side with labels"""
+def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_resolution,
+                     downsampled_render_img=None, downsampled_gt_img=None, resolution_info=None):
+    """Save debug visualization with render and GT, plus optional downsampled versions"""
     # Convert tensors to numpy arrays (CHW -> HWC, 0-1 range)
     render_np = render_img.detach().cpu().permute(1, 2, 0).numpy()
     gt_np = gt_img.detach().cpu().permute(1, 2, 0).numpy()
@@ -39,32 +41,90 @@ def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_r
     render_pil = Image.fromarray(render_np)
     gt_pil = Image.fromarray(gt_np)
 
-    # Get dimensions
-    h, w = render_np.shape[:2]
-    label_height = 30
+    # Process downsampled images if provided
+    if downsampled_render_img is not None and downsampled_gt_img is not None:
+        downsampled_render_np = downsampled_render_img.detach().cpu().permute(1, 2, 0).numpy()
+        downsampled_gt_np = downsampled_gt_img.detach().cpu().permute(1, 2, 0).numpy()
 
-    # Create combined image with labels
-    combined_width = w * 2
-    combined_height = h + label_height
-    combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
+        downsampled_render_np = np.clip(downsampled_render_np * 255, 0, 255).astype(np.uint8)
+        downsampled_gt_np = np.clip(downsampled_gt_np * 255, 0, 255).astype(np.uint8)
 
-    # Paste images
-    combined.paste(render_pil, (0, label_height))
-    combined.paste(gt_pil, (w, label_height))
+        # Resize downsampled images to match full resolution for comparison
+        downsampled_render_pil = Image.fromarray(downsampled_render_np).resize(
+            (render_pil.width, render_pil.height), Image.NEAREST
+        )
+        downsampled_gt_pil = Image.fromarray(downsampled_gt_np).resize(
+            (gt_pil.width, gt_pil.height), Image.NEAREST
+        )
 
-    # Add labels
-    draw = ImageDraw.Draw(combined)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-    except:
-        font = ImageFont.load_default()
+        # Create 2x2 grid layout
+        h, w = render_np.shape[:2]
+        label_height = 30
 
-    # Add text labels
-    render_label = f"Render (Iter: {iteration})"
-    gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
+        # Create combined image with labels (2x2 grid)
+        combined_width = w * 2
+        combined_height = (h + label_height) * 2
+        combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
 
-    draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
-    draw.text((w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
+        # Paste images in 2x2 grid
+        # Top row: Full resolution render and GT
+        combined.paste(render_pil, (0, label_height))
+        combined.paste(gt_pil, (w, label_height))
+        # Bottom row: Downsampled render and GT
+        combined.paste(downsampled_render_pil, (0, h + label_height * 2))
+        combined.paste(downsampled_gt_pil, (w, h + label_height * 2))
+
+        # Add labels
+        draw = ImageDraw.Draw(combined)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        except:
+            font = ImageFont.load_default()
+
+        # Top row labels
+        render_label = f"Render (Iter: {iteration})"
+        gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
+        draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
+        draw.text((w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
+
+        # Bottom row labels
+        if resolution_info:
+            stage = resolution_info.get('stage', 1)
+            scale = resolution_info.get('scale', 1.0)
+            elapsed = resolution_info.get('elapsed_time', 0.0)
+            ds_res = f"{downsampled_render_np.shape[1]}x{downsampled_render_np.shape[0]}"
+            downsampled_render_label = f"Downsampled Render (Stage {stage}, {scale:.2%}, {ds_res})"
+            downsampled_gt_label = f"Downsampled GT (Time: {elapsed:.1f}s)"
+        else:
+            downsampled_render_label = "Downsampled Render"
+            downsampled_gt_label = "Downsampled GT"
+
+        draw.text((10, h + label_height + 5), downsampled_render_label, fill=(0, 0, 0), font=font)
+        draw.text((w + 10, h + label_height + 5), downsampled_gt_label, fill=(0, 0, 0), font=font)
+
+    else:
+        # Original 1x2 layout if no downsampled images
+        h, w = render_np.shape[:2]
+        label_height = 30
+
+        combined_width = w * 2
+        combined_height = h + label_height
+        combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
+
+        combined.paste(render_pil, (0, label_height))
+        combined.paste(gt_pil, (w, label_height))
+
+        draw = ImageDraw.Draw(combined)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        except:
+            font = ImageFont.load_default()
+
+        render_label = f"Render (Iter: {iteration})"
+        gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
+
+        draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
+        draw.text((w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
 
     # Save image
     save_path = os.path.join(debug_dir, f"debug_iter_{iteration:06d}.png")
@@ -146,6 +206,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     debug_view_data = None
     last_debug_save_time = None
     debug_iteration = 0
+    resolution_scheduler = None
     if pp.debug:
         debug_dir = os.path.join(lp.model_path, "debug")
         os.makedirs(debug_dir, exist_ok=True)
@@ -168,14 +229,23 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 'frustumplane': frustumplane.cuda(),
                 'gt_image': gt_image.cuda() / 255.0,
                 'view_id': debug_view_idx,
-                'resolution': f"{gt_image.shape[3]}x{gt_image.shape[2]}"
+                'resolution': f"{gt_image.shape[3]}x{gt_image.shape[2]}",
+                'camera': debug_camera
             }
             break
+
+        # Initialize resolution scheduler
+        resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
+        print(f"Resolution scheduler initialized: {resolution_scheduler.num_stages} stages, {resolution_scheduler.stage_duration}s per stage")
 
         last_debug_save_time = time.time()
 
     # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
+
+    # Start resolution scheduler if in debug mode
+    if pp.debug and resolution_scheduler is not None:
+        resolution_scheduler.start()
 
     for epoch in range(start_epoch,total_epoch):
         # Check if training time has exceeded 59.5 seconds BEFORE starting the epoch
@@ -256,11 +326,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 schedular.step()
 
                 # Debug visualization: save every 5 seconds
-                if pp.debug and debug_view_data is not None:
+                if pp.debug and debug_view_data is not None and resolution_scheduler is not None:
                     current_time = time.time()
                     if current_time - last_debug_save_time >= 5.0:
                         with torch.no_grad():
-                            # Render the fixed debug view
+                            # Get cluster information for rendering
                             _cluster_origin = None
                             _cluster_extend = None
                             if pp.cluster_size:
@@ -268,6 +338,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                     xyz, scale.exp(), torch.nn.functional.normalize(rot, dim=0)
                                 )
 
+                            # Render at full resolution
                             _, culled_xyz, culled_scale, culled_rot, culled_sh_0, culled_sh_rest, culled_opacity = \
                                 render.render_preprocess(
                                     _cluster_origin, _cluster_extend, debug_view_data['frustumplane'],
@@ -280,11 +351,83 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 actived_sh_degree, debug_view_data['gt_image'].shape[2:], pp
                             )
 
+                            # Get downsampled resolution from scheduler
+                            resolution_info = resolution_scheduler.get_info_dict()
+                            full_height = debug_view_data['gt_image'].shape[2]
+                            full_width = debug_view_data['gt_image'].shape[3]
+                            ds_height, ds_width = resolution_scheduler.get_downsampled_shape(full_height, full_width)
+
+                            # Create downsampled projection matrix
+                            proj_matrix_np = debug_view_data['proj_matrix'].cpu().numpy()[0]
+                            downsampled_proj_matrix_np = resolution_scheduler.get_downsampled_proj_matrix(
+                                proj_matrix_np, full_height, full_width
+                            )
+                            downsampled_proj_matrix = torch.tensor(downsampled_proj_matrix_np, dtype=torch.float32, device='cuda').unsqueeze(0)
+
+                            # Create frustum plane for downsampled resolution
+                            view_matrix_np = debug_view_data['view_matrix'].cpu().numpy()[0]
+                            viewproj_matrix = view_matrix_np @ downsampled_proj_matrix_np
+                            downsampled_frustumplane = np.zeros((6, 4), dtype=np.float32)
+                            # Left plane
+                            downsampled_frustumplane[0] = [viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
+                                                           viewproj_matrix[1, 3] + viewproj_matrix[1, 0],
+                                                           viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
+                                                           viewproj_matrix[3, 3] + viewproj_matrix[3, 0]]
+                            # Right plane
+                            downsampled_frustumplane[1] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
+                                                           viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
+                                                           viewproj_matrix[2, 3] - viewproj_matrix[2, 0],
+                                                           viewproj_matrix[3, 3] - viewproj_matrix[3, 0]]
+                            # Bottom plane
+                            downsampled_frustumplane[2] = [viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
+                                                           viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
+                                                           viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
+                                                           viewproj_matrix[3, 3] + viewproj_matrix[3, 1]]
+                            # Top plane
+                            downsampled_frustumplane[3] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 1],
+                                                           viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
+                                                           viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
+                                                           viewproj_matrix[3, 3] - viewproj_matrix[3, 1]]
+                            # Near plane
+                            downsampled_frustumplane[4] = [viewproj_matrix[0, 2],
+                                                           viewproj_matrix[1, 2],
+                                                           viewproj_matrix[2, 2],
+                                                           viewproj_matrix[3, 2]]
+                            # Far plane
+                            downsampled_frustumplane[5] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
+                                                           viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
+                                                           viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
+                                                           viewproj_matrix[3, 3] - viewproj_matrix[3, 2]]
+                            downsampled_frustumplane = torch.tensor(downsampled_frustumplane, dtype=torch.float32, device='cuda').unsqueeze(0)
+
+                            # Render at downsampled resolution
+                            _, ds_culled_xyz, ds_culled_scale, ds_culled_rot, ds_culled_sh_0, ds_culled_sh_rest, ds_culled_opacity = \
+                                render.render_preprocess(
+                                    _cluster_origin, _cluster_extend, downsampled_frustumplane,
+                                    xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
+                                )
+
+                            downsampled_render, _, _, _, _ = render.render(
+                                debug_view_data['view_matrix'], downsampled_proj_matrix,
+                                ds_culled_xyz, ds_culled_scale, ds_culled_rot, ds_culled_sh_0, ds_culled_sh_rest, ds_culled_opacity,
+                                actived_sh_degree, (ds_height, ds_width), pp
+                            )
+
+                            # Downsample the GT image
+                            downsampled_gt = torch.nn.functional.interpolate(
+                                debug_view_data['gt_image'],
+                                size=(ds_height, ds_width),
+                                mode='bilinear',
+                                align_corners=False
+                            )
+
                             # Save the debug visualization
                             __save_debug_view(
                                 debug_dir, debug_iteration,
                                 debug_render[0], debug_view_data['gt_image'][0],
-                                debug_view_data['view_id'], debug_view_data['resolution']
+                                debug_view_data['view_id'], debug_view_data['resolution'],
+                                downsampled_render[0], downsampled_gt[0],
+                                resolution_info
                             )
 
                             debug_iteration += 1
