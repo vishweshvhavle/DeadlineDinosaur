@@ -157,7 +157,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         debug_camera = cameras_info[debug_frame.camera_id]
 
         # Precompute debug view data
-        from ..data import CameraFrameDataset
         debug_dataset = CameraFrameDataset(cameras_info, [debug_frame], lp.resolution, pp.device_preload)
         debug_loader = DataLoader(debug_dataset, batch_size=1, shuffle=False, pin_memory=not pp.device_preload)
 
