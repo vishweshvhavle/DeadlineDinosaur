@@ -414,12 +414,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 actived_sh_degree, (ds_height, ds_width), pp
                             )
 
-                            # Downsample the GT image
-                            downsampled_gt = torch.nn.functional.interpolate(
+                            # Downsample the GT image using high-quality method
+                            downsampled_gt = resolution_scheduler.downsample_image_hq(
                                 debug_view_data['gt_image'],
-                                size=(ds_height, ds_width),
-                                mode='bilinear',
-                                align_corners=False
+                                target_height=ds_height,
+                                target_width=ds_width,
+                                use_lanczos=True
                             )
 
                             # Save the debug visualization
