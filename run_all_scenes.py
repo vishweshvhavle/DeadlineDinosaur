@@ -42,9 +42,10 @@ def run_pipeline(args):
 
         print(f"\n[{i+1}/{len(scene_folders)}] Training: {scene_name}")
 
+        debug_flag = "--debug" if args.debug else ""
         train_cmd = (
             f"CUDA_VISIBLE_DEVICES={args.gpu} CUDA_LAUNCH_BLOCKING=1 python example_train.py "
-            f"-s {source_path} -m {model_path} {train_config}"
+            f"-s {source_path} -m {model_path} {train_config} {debug_flag}"
         )
         print(train_cmd)
         os.system(train_cmd)
@@ -91,6 +92,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_dir", default="data/ProcessedDataset")
     parser.add_argument("--output_dir", default="outputs")
     parser.add_argument("--gpu", default="0")
-    
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode to save visualization every 5 seconds")
+
     args = parser.parse_args()
     run_pipeline(args)
