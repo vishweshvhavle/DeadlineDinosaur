@@ -276,6 +276,11 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
+    def should_collect_statistics(self,epoch:int):
+        """Check if statistics should be collected (every epoch in densification range)"""
+        return epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from
+
+    @torch.no_grad()
     def step(self,optimizer:torch.optim.Optimizer,epoch:int,scheduler=None,current_iteration=None,current_n_primitives=None,current_render_scale=None):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
@@ -299,7 +304,7 @@ class DensityControllerOfficial(DensityControllerBase):
                 bUpdate=True
             if bUpdate:
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-                StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
+                StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.should_collect_statistics)
                 torch.cuda.empty_cache()
         return self._get_params_from_optimizer(optimizer)
     
