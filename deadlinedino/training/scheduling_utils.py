@@ -111,9 +111,15 @@ class ResolutionScheduler:
     def get_downsampled_proj_matrix(self, proj_matrix: np.ndarray,
                                      full_height: int, full_width: int) -> np.ndarray:
         """
-        Get a projection matrix adjusted for the current downsampled resolution.
+        Get a projection matrix adjusted for center crop rendering at reduced resolution.
 
-        When we downsample an image, the focal length in normalized coordinates needs to be scaled.
+        For center crop: we keep the same field of view but render at smaller resolution.
+        This requires dividing the focal lengths by the scale factor.
+
+        Example: 100x100 image reduced by half (scale=0.5) -> 50x50 center region
+        - Same angular FOV maintained
+        - Rendered image is 50x50 (center crop of what would be 100x100)
+        - GT is downsampled to 50x50 to match
 
         Args:
             proj_matrix: Original projection matrix (4x4)
@@ -121,17 +127,18 @@ class ResolutionScheduler:
             full_width: Full resolution width
 
         Returns:
-            Adjusted projection matrix for current resolution
+            Adjusted projection matrix for center crop at current resolution
         """
         scale = self.get_resolution_scale()
 
         # Create a copy of the projection matrix
         downsampled_proj = proj_matrix.copy()
 
-        # Scale the focal lengths by the resolution scale
+        # For center crop: divide focal lengths by scale to maintain same FOV at smaller resolution
         # proj_matrix[0,0] is focal_x, proj_matrix[1,1] is focal_y
-        downsampled_proj[0, 0] = proj_matrix[0, 0] * scale
-        downsampled_proj[1, 1] = proj_matrix[1, 1] * scale
+        # This creates a center crop effect: same FOV rendered at reduced resolution
+        downsampled_proj[0, 0] = proj_matrix[0, 0] / scale
+        downsampled_proj[1, 1] = proj_matrix[1, 1] / scale
 
         return downsampled_proj
 
