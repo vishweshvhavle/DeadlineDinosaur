@@ -9,6 +9,7 @@ import os
 import time
 import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
 
 from .. import arguments
 from .. import data
@@ -23,6 +24,51 @@ from .. import utils
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
+
+def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_resolution):
+    """Save debug visualization with render and GT side by side with labels"""
+    # Convert tensors to numpy arrays (CHW -> HWC, 0-1 range)
+    render_np = render_img.detach().cpu().permute(1, 2, 0).numpy()
+    gt_np = gt_img.detach().cpu().permute(1, 2, 0).numpy()
+
+    # Clip and convert to uint8
+    render_np = np.clip(render_np * 255, 0, 255).astype(np.uint8)
+    gt_np = np.clip(gt_np * 255, 0, 255).astype(np.uint8)
+
+    # Create PIL images
+    render_pil = Image.fromarray(render_np)
+    gt_pil = Image.fromarray(gt_np)
+
+    # Get dimensions
+    h, w = render_np.shape[:2]
+    label_height = 30
+
+    # Create combined image with labels
+    combined_width = w * 2
+    combined_height = h + label_height
+    combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
+
+    # Paste images
+    combined.paste(render_pil, (0, label_height))
+    combined.paste(gt_pil, (w, label_height))
+
+    # Add labels
+    draw = ImageDraw.Draw(combined)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+    except:
+        font = ImageFont.load_default()
+
+    # Add text labels
+    render_label = f"Render (Iter: {iteration})"
+    gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
+
+    draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
+    draw.text((w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
+
+    # Save image
+    save_path = os.path.join(debug_dir, f"debug_iter_{iteration:06d}.png")
+    combined.save(save_path)
 
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
@@ -94,6 +140,40 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
+
+    # Debug mode initialization
+    debug_dir = None
+    debug_view_data = None
+    last_debug_save_time = None
+    debug_iteration = 0
+    if pp.debug:
+        debug_dir = os.path.join(lp.model_path, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"Debug mode enabled. Debug visualizations will be saved to: {debug_dir}")
+
+        # Select a fixed view for debugging (use the first training view)
+        debug_view_idx = 0
+        debug_frame = training_frames[debug_view_idx]
+        debug_camera = cameras_info[debug_frame.camera_id]
+
+        # Precompute debug view data
+        from ..data import CameraFrameDataset
+        debug_dataset = CameraFrameDataset(cameras_info, [debug_frame], lp.resolution, pp.device_preload)
+        debug_loader = DataLoader(debug_dataset, batch_size=1, shuffle=False, pin_memory=not pp.device_preload)
+
+        # Get the view data
+        for view_matrix, proj_matrix, frustumplane, gt_image, idx in debug_loader:
+            debug_view_data = {
+                'view_matrix': view_matrix.cuda(),
+                'proj_matrix': proj_matrix.cuda(),
+                'frustumplane': frustumplane.cuda(),
+                'gt_image': gt_image.cuda() / 255.0,
+                'view_id': debug_view_idx,
+                'resolution': f"{gt_image.shape[3]}x{gt_image.shape[2]}"
+            }
+            break
+
+        last_debug_save_time = time.time()
 
     # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
@@ -175,6 +255,41 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.step()
                     # proj_opt.zero_grad()
                 schedular.step()
+
+                # Debug visualization: save every 5 seconds
+                if pp.debug and debug_view_data is not None:
+                    current_time = time.time()
+                    if current_time - last_debug_save_time >= 5.0:
+                        with torch.no_grad():
+                            # Render the fixed debug view
+                            _cluster_origin = None
+                            _cluster_extend = None
+                            if pp.cluster_size:
+                                _cluster_origin, _cluster_extend = scene.cluster.get_cluster_AABB(
+                                    xyz, scale.exp(), torch.nn.functional.normalize(rot, dim=0)
+                                )
+
+                            _, culled_xyz, culled_scale, culled_rot, culled_sh_0, culled_sh_rest, culled_opacity = \
+                                render.render_preprocess(
+                                    _cluster_origin, _cluster_extend, debug_view_data['frustumplane'],
+                                    xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
+                                )
+
+                            debug_render, _, _, _, _ = render.render(
+                                debug_view_data['view_matrix'], debug_view_data['proj_matrix'],
+                                culled_xyz, culled_scale, culled_rot, culled_sh_0, culled_sh_rest, culled_opacity,
+                                actived_sh_degree, debug_view_data['gt_image'].shape[2:], pp
+                            )
+
+                            # Save the debug visualization
+                            __save_debug_view(
+                                debug_dir, debug_iteration,
+                                debug_render[0], debug_view_data['gt_image'][0],
+                                debug_view_data['view_id'], debug_view_data['resolution']
+                            )
+
+                            debug_iteration += 1
+                            last_debug_save_time = current_time
 
         if epoch in test_epochs:
             with torch.no_grad():
