@@ -104,9 +104,9 @@ if __name__ == "__main__":
         tvec=view_params[:,4:]
 
     #metrics
-    ssim_metrics=ssim.StructuralSimilarityIndexMeasure(data_range=1.0).cuda()
+    # ssim_metrics=ssim.StructuralSimilarityIndexMeasure(data_range=1.0).cuda()
     psnr_metrics=psnr.PeakSignalNoiseRatio(data_range=1.0).cuda()
-    lpip_metrics=lpip.LearnedPerceptualImagePatchSimilarity(net_type='vgg').cuda()
+    # lpip_metrics=lpip.LearnedPerceptualImagePatchSimilarity(net_type='vgg').cuda()
 
     #iter
     if lp.eval:
@@ -116,9 +116,9 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         for loader_name,loader in loaders.items():
-            ssim_list=[]
+            # ssim_list=[]
             psnr_list=[]
-            lpips_list=[]
+            # lpips_list=[]
             for index,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(loader):
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
@@ -141,18 +141,18 @@ if __name__ == "__main__":
                 img,transmitance,depth,normal,_=deadlinedino.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                             lp.sh_degree,gt_image.shape[2:],pp)
                 psnr_value=psnr_metrics(img,gt_image)
-                ssim_list.append(ssim_metrics(img,gt_image).unsqueeze(0))
+                # ssim_list.append(ssim_metrics(img,gt_image).unsqueeze(0))
                 psnr_list.append(psnr_value.unsqueeze(0))
-                lpips_list.append(lpip_metrics(img,gt_image).unsqueeze(0))
+                # lpips_list.append(lpip_metrics(img,gt_image).unsqueeze(0))
                 if OUTPUT_FILE:
                     plt.imsave(os.path.join(lp.model_path,loader_name,"{}-{:.2f}-rd.png".format(index,float(psnr_value))),img.detach().cpu()[0].permute(1,2,0).numpy())
                     plt.imsave(os.path.join(lp.model_path,loader_name,"{}-{:.2f}-gt.png".format(index,float(psnr_value))),gt_image.detach().cpu()[0].permute(1,2,0).numpy())
-            ssim_mean=torch.concat(ssim_list,dim=0).mean()
+            # ssim_mean=torch.concat(ssim_list,dim=0).mean()
             psnr_mean=torch.concat(psnr_list,dim=0).mean()
-            lpips_mean=torch.concat(lpips_list,dim=0).mean()
+            # lpips_mean=torch.concat(lpips_list,dim=0).mean()
 
             print("  Scene:{0}".format(lp.model_path+" "+loader_name))
-            print("  SSIM : {:>12.7f}".format(float(ssim_mean)))
+            # print("  SSIM : {:>12.7f}".format(float(ssim_mean)))
             print("  PSNR : {:>12.7f}".format(float(psnr_mean)))
-            print("  LPIPS: {:>12.7f}".format(float(lpips_mean)))
+            # print("  LPIPS: {:>12.7f}".format(float(lpips_mean)))
             print("")
