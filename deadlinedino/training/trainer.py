@@ -49,30 +49,27 @@ def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_r
         downsampled_render_np = np.clip(downsampled_render_np * 255, 0, 255).astype(np.uint8)
         downsampled_gt_np = np.clip(downsampled_gt_np * 255, 0, 255).astype(np.uint8)
 
-        # Resize downsampled images to match full resolution for comparison
-        downsampled_render_pil = Image.fromarray(downsampled_render_np).resize(
-            (render_pil.width, render_pil.height), Image.NEAREST
-        )
-        downsampled_gt_pil = Image.fromarray(downsampled_gt_np).resize(
-            (gt_pil.width, gt_pil.height), Image.NEAREST
-        )
+        # Keep downsampled images at their native resolution (don't upscale)
+        downsampled_render_pil = Image.fromarray(downsampled_render_np)
+        downsampled_gt_pil = Image.fromarray(downsampled_gt_np)
 
-        # Create 2x2 grid layout
-        h, w = render_np.shape[:2]
+        # Create 2x2 grid layout with proper sizing for different resolutions
+        full_h, full_w = render_np.shape[:2]
+        ds_h, ds_w = downsampled_render_np.shape[:2]
         label_height = 30
 
-        # Create combined image with labels (2x2 grid)
-        combined_width = w * 2
-        combined_height = (h + label_height) * 2
+        # Calculate dimensions: use full resolution for width, stack vertically
+        combined_width = full_w * 2
+        combined_height = (full_h + label_height) + (ds_h + label_height)
         combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
 
-        # Paste images in 2x2 grid
+        # Paste images in 2x2 grid (top row is full res, bottom row is downsampled at native res)
         # Top row: Full resolution render and GT
         combined.paste(render_pil, (0, label_height))
-        combined.paste(gt_pil, (w, label_height))
-        # Bottom row: Downsampled render and GT
-        combined.paste(downsampled_render_pil, (0, h + label_height * 2))
-        combined.paste(downsampled_gt_pil, (w, h + label_height * 2))
+        combined.paste(gt_pil, (full_w, label_height))
+        # Bottom row: Downsampled render and GT at their native resolution
+        combined.paste(downsampled_render_pil, (0, full_h + label_height * 2))
+        combined.paste(downsampled_gt_pil, (full_w, full_h + label_height * 2))
 
         # Add labels
         draw = ImageDraw.Draw(combined)
@@ -85,7 +82,7 @@ def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_r
         render_label = f"Render (Iter: {iteration})"
         gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
         draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
-        draw.text((w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
+        draw.text((full_w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
 
         # Bottom row labels
         if resolution_info:
@@ -100,8 +97,8 @@ def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_r
             downsampled_render_label = "Downsampled Render"
             downsampled_gt_label = "Downsampled GT"
 
-        draw.text((10, h + label_height + 5), downsampled_render_label, fill=(0, 0, 0), font=font)
-        draw.text((w + 10, h + label_height + 5), downsampled_gt_label, fill=(0, 0, 0), font=font)
+        draw.text((10, full_h + label_height + 5), downsampled_render_label, fill=(0, 0, 0), font=font)
+        draw.text((full_w + 10, full_h + label_height + 5), downsampled_gt_label, fill=(0, 0, 0), font=font)
 
     else:
         # Original 1x2 layout if no downsampled images
