@@ -325,13 +325,22 @@ class ResolutionScheduler:
         """
         Get a projection matrix adjusted for rendering at reduced resolution.
 
-        When downsampling, we need to scale the focal lengths proportionally to maintain
-        the same field of view at the reduced resolution.
+        When downsampling, the focal lengths in the projection matrix must be INVERSELY
+        scaled to maintain the same field of view at the reduced resolution.
+
+        The projection matrix stores focal values as: focal_x = focal_pixels / (width * 0.5)
+        When rendering at a lower resolution with scale < 1:
+        - New resolution: width_new = width * scale, height_new = height * scale
+        - To maintain the same view frustum (angular field of view), we need:
+          focal_x_new = focal_pixels / (width_new * 0.5)
+                      = focal_pixels / (width * scale * 0.5)
+                      = (focal_pixels / (width * 0.5)) / scale
+                      = focal_x_original / scale
 
         Example: 1000x1000 image reduced by scale=0.5 -> 500x500 image
-        - If original focal_x = 1000, downsampled focal_x = 500 (multiply by scale)
-        - This maintains the same angular FOV at the new resolution
-        - Both GT and rendered image are at 500x500
+        - Original focal_x in proj matrix = f / 500 (where f is focal length in pixels)
+        - Downsampled focal_x = (f / 500) / 0.5 = f / 250 (focal value INCREASES)
+        - This maintains the same angular FOV at the new 500x500 resolution
 
         Args:
             proj_matrix: Original projection matrix (4x4)
@@ -346,11 +355,11 @@ class ResolutionScheduler:
         # Create a copy of the projection matrix
         downsampled_proj = proj_matrix.copy()
 
-        # Scale focal lengths proportionally with resolution
+        # Scale focal lengths INVERSELY with resolution to maintain view frustum
         # proj_matrix[0,0] is focal_x, proj_matrix[1,1] is focal_y
-        # When resolution is reduced by scale, focal lengths are also reduced by scale
-        downsampled_proj[0, 0] = proj_matrix[0, 0] * scale
-        downsampled_proj[1, 1] = proj_matrix[1, 1] * scale
+        # When resolution is reduced (scale < 1), focal values must increase (divide by scale)
+        downsampled_proj[0, 0] = proj_matrix[0, 0] / scale
+        downsampled_proj[1, 1] = proj_matrix[1, 1] / scale
 
         return downsampled_proj
 
