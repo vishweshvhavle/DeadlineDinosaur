@@ -6,14 +6,7 @@ import math
 import sys
 import os
 
-# Add FastLanczos to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../submodules/lanczos-resampling'))
-try:
-    from FastLanczos import lanczos_resample
-    LANCZOS_AVAILABLE = True
-except ImportError:
-    LANCZOS_AVAILABLE = False
-    print("[ WARNING ] FastLanczos not available, falling back to torch interpolation")
+# FastLanczos has been removed - using torch interpolation for all downsampling
 
 
 class Scheduler(_LRScheduler):
@@ -291,13 +284,20 @@ class ResolutionScheduler:
         scale = (1 / ((elapsed - i_now) / (i_nxt - i_now) * (1/s_now**2 - 1/s_lst**2) + 1/s_lst**2))**0.5
         return 1.0 / scale
 
-    def get_downsampled_shape(self, full_height: int, full_width: int) -> tuple[int, int]:
+    def get_downsampled_shape(self, full_height: int, full_width: int,
+                              tile_height: int = 8, tile_width: int = 16) -> tuple[int, int]:
         """
         Get the downsampled image shape based on current resolution scale.
+
+        Ensures dimensions are compatible with CUDA tile-based rendering by:
+        - Enforcing minimum dimensions (at least 2x tile size)
+        - Rounding to multiples of tile size for better alignment
 
         Args:
             full_height: Full resolution height
             full_width: Full resolution width
+            tile_height: Tile height for CUDA kernels (default: 8)
+            tile_width: Tile width for CUDA kernels (default: 16)
 
         Returns:
             (height, width) tuple for current resolution
@@ -305,9 +305,19 @@ class ResolutionScheduler:
         scale = self.get_resolution_scale()
         downsampled_height = int(full_height * scale)
         downsampled_width = int(full_width * scale)
-        # Ensure at least 1 pixel
-        downsampled_height = max(1, downsampled_height)
-        downsampled_width = max(1, downsampled_width)
+
+        # Ensure minimum dimensions: at least 2x the tile size
+        # This prevents CUDA kernel launch errors with very small resolutions
+        min_height = tile_height * 2
+        min_width = tile_width * 2
+        downsampled_height = max(min_height, downsampled_height)
+        downsampled_width = max(min_width, downsampled_width)
+
+        # Round to nearest multiple of tile size for better alignment
+        # This helps avoid edge cases in tile-based CUDA kernels
+        downsampled_height = ((downsampled_height + tile_height - 1) // tile_height) * tile_height
+        downsampled_width = ((downsampled_width + tile_width - 1) // tile_width) * tile_width
+
         return downsampled_height, downsampled_width
 
     def get_downsampled_proj_matrix(self, proj_matrix: np.ndarray,
@@ -366,13 +376,13 @@ class ResolutionScheduler:
     def downsample_image_hq(image: torch.Tensor, target_height: int, target_width: int,
                            use_lanczos: bool = True) -> torch.Tensor:
         """
-        High-quality image downsampling using Lanczos or bilinear interpolation.
+        High-quality image downsampling using torch interpolation.
 
         Args:
             image: Input image tensor (C, H, W) or (B, C, H, W)
             target_height: Target height
             target_width: Target width
-            use_lanczos: Use Lanczos resampling if available (default: True)
+            use_lanczos: Unused parameter (kept for compatibility)
 
         Returns:
             Downsampled image tensor
@@ -380,70 +390,15 @@ class ResolutionScheduler:
         if image.shape[-2] == target_height and image.shape[-1] == target_width:
             return image
 
-        # Use FastLanczos if available and requested
-        if use_lanczos and LANCZOS_AVAILABLE:
-            return ResolutionScheduler._downsample_lanczos(image, target_height, target_width)
-        else:
-            # Fallback to torch interpolation
-            return ResolutionScheduler._downsample_torch(image, target_height, target_width)
-
-    @staticmethod
-    def _downsample_lanczos(image: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
-        """
-        Downsample using FastLanczos (high quality).
-
-        Args:
-            image: Input image tensor (C, H, W) or (B, C, H, W)
-            target_height: Target height
-            target_width: Target width
-
-        Returns:
-            Downsampled image tensor
-        """
-        original_shape = image.shape
-        batch_mode = len(original_shape) == 4
-
-        if batch_mode:
-            # Process each image in batch
-            batch_size = original_shape[0]
-            results = []
-            for i in range(batch_size):
-                img = image[i]  # (C, H, W)
-                # Lanczos expects (H, W, C) format
-                img = img.permute(1, 2, 0).contiguous()  # (H, W, C)
-                img = img.cpu()  # FastLanczos works on CPU
-
-                # Downsample
-                downsampled = lanczos_resample(img, size=(target_height, target_width), kernel_size=2)
-
-                # Convert back to (C, H, W) and move to GPU
-                downsampled = downsampled.permute(2, 0, 1).contiguous()
-                if image.is_cuda:
-                    downsampled = downsampled.cuda()
-
-                results.append(downsampled)
-
-            return torch.stack(results, dim=0)
-        else:
-            # Single image (C, H, W)
-            # Lanczos expects (H, W, C) format
-            img = image.permute(1, 2, 0).contiguous()  # (H, W, C)
-            img = img.cpu()  # FastLanczos works on CPU
-
-            # Downsample
-            downsampled = lanczos_resample(img, size=(target_height, target_width), kernel_size=2)
-
-            # Convert back to (C, H, W) and move to GPU
-            downsampled = downsampled.permute(2, 0, 1).contiguous()
-            if image.is_cuda:
-                downsampled = downsampled.cuda()
-
-            return downsampled
+        # Use torch interpolation
+        return ResolutionScheduler._downsample_torch(image, target_height, target_width)
 
     @staticmethod
     def _downsample_torch(image: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
         """
-        Downsample using torch.nn.functional.interpolate (fallback).
+        Downsample using torch.nn.functional.interpolate.
+
+        Uses area interpolation for high-quality downsampling.
 
         Args:
             image: Input image tensor (C, H, W) or (B, C, H, W)
