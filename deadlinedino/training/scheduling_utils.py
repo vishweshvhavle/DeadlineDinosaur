@@ -350,17 +350,20 @@ class ResolutionScheduler:
         Returns:
             Adjusted projection matrix for rendering at downsampled resolution
         """
+    
         scale = self.get_resolution_scale()
-
-        # Create a copy of the projection matrix
         downsampled_proj = proj_matrix.copy()
+        
+        # For normalized projection matrices, NO scaling needed for focal values
+        # The normalization already accounts for resolution changes
+        
+        # Only scale principal point (if non-zero and not centered)
+        if abs(proj_matrix[0, 2]) > 1e-6:
+            downsampled_proj[0, 2] = proj_matrix[0, 2] * scale
+        if abs(proj_matrix[1, 2]) > 1e-6:
+            downsampled_proj[1, 2] = proj_matrix[1, 2] * scale
 
-        # Scale focal lengths INVERSELY with resolution to maintain view frustum
-        # proj_matrix[0,0] is focal_x, proj_matrix[1,1] is focal_y
-        # When resolution is reduced (scale < 1), focal values must increase (divide by scale)
-        downsampled_proj[0, 0] = proj_matrix[0, 0] / scale
-        downsampled_proj[1, 1] = proj_matrix[1, 1] / scale
-
+        
         return downsampled_proj
 
     def get_info_dict(self) -> dict:
