@@ -92,9 +92,10 @@ def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_r
             stage = resolution_info.get('stage', 1)
             scale = resolution_info.get('scale', 1.0)
             elapsed = resolution_info.get('elapsed_time', 0.0)
-            ds_res = f"{downsampled_render_np.shape[1]}x{downsampled_render_np.shape[0]}"
-            downsampled_render_label = f"Downsampled Render (Stage {stage}, {scale:.2%}, {ds_res})"
-            downsampled_gt_label = f"Downsampled GT (Time: {elapsed:.1f}s)"
+            ds_render_res = f"{downsampled_render_np.shape[1]}x{downsampled_render_np.shape[0]}"
+            ds_gt_res = f"{downsampled_gt_np.shape[1]}x{downsampled_gt_np.shape[0]}"
+            downsampled_render_label = f"Downsampled Render (Stage {stage}, {scale:.2%}, {ds_render_res})"
+            downsampled_gt_label = f"Downsampled GT ({ds_gt_res}, Time: {elapsed:.1f}s)"
         else:
             downsampled_render_label = "Downsampled Render"
             downsampled_gt_label = "Downsampled GT"
