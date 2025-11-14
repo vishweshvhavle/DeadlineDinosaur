@@ -236,7 +236,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         last_debug_save_time = time.time()
 
     # Initialize resolution scheduler (always needed, not just for debug mode)
-    resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
+    # Using paper's approach: 1/5, 1/4, 1/3, 1/2, 1/1 progression
+    resolution_scheduler = ResolutionScheduler(num_stages=5, stage_duration=9.0)
     if pp.debug:
         print(f"Resolution scheduler initialized: {resolution_scheduler.num_stages} stages, {resolution_scheduler.stage_duration}s per stage")
 
