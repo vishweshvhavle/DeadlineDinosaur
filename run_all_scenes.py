@@ -30,7 +30,7 @@ def run_pipeline(args):
     # Training config
     train_config = (
         "--sh_degree 3 --source_type colmap "
-        "--target_primitives 1000000 --iterations 4500 "
+        "--target_primitives 1000000 --iterations 30000 "
         "--position_lr_max_steps 4500 --position_lr_final 0.000016 "
         "--densification_interval 2"
     )
