@@ -236,15 +236,16 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         last_debug_save_time = time.time()
 
     # Initialize resolution scheduler (always needed, not just for debug mode)
-    resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
+    # resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
+    resolution_scheduler = ResolutionScheduler(op, pp, original_images=None)
     if pp.debug:
-        print(f"Resolution scheduler initialized: {resolution_scheduler.num_stages} stages, {resolution_scheduler.stage_duration}s per stage")
+        print(f"Resolution scheduler initialized with mode: {resolution_scheduler.resolution_mode}")
 
     # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
 
-    # Start resolution scheduler
-    resolution_scheduler.start()
+    # # Start resolution scheduler
+    # resolution_scheduler.start()
 
     for epoch in range(start_epoch,total_epoch):
         # Check if training time has exceeded 59.5 seconds BEFORE starting the epoch
@@ -306,7 +307,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 full_height = gt_image.shape[2]
                 full_width = gt_image.shape[3]
                 ds_height, ds_width = resolution_scheduler.get_downsampled_dimensions(
-                    full_height, full_width, tile_h, tile_w
+                    full_height, full_width
                 )
 
                 # Debug logging
@@ -321,41 +322,57 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 )
                 downsampled_proj_matrix = torch.tensor(downsampled_proj_matrix_np, dtype=torch.float32, device='cuda').unsqueeze(0)
 
-                # Create frustum plane for downsampled resolution
+                # Create frustum plane for downsampled resolution as PyTorch tensor
                 view_matrix_np = view_matrix.cpu().numpy()[0]
                 viewproj_matrix = view_matrix_np @ downsampled_proj_matrix_np
-                downsampled_frustumplane = np.zeros((6, 4), dtype=np.float32)
-                # Left plane
-                downsampled_frustumplane[0] = [viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
-                                               viewproj_matrix[1, 3] + viewproj_matrix[1, 0],
-                                               viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
-                                               viewproj_matrix[3, 3] + viewproj_matrix[3, 0]]
-                # Right plane
-                downsampled_frustumplane[1] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
-                                               viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
-                                               viewproj_matrix[2, 3] - viewproj_matrix[2, 0],
-                                               viewproj_matrix[3, 3] - viewproj_matrix[3, 0]]
-                # Bottom plane
-                downsampled_frustumplane[2] = [viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
-                                               viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
-                                               viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
-                                               viewproj_matrix[3, 3] + viewproj_matrix[3, 1]]
-                # Top plane
-                downsampled_frustumplane[3] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 1],
-                                               viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
-                                               viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
-                                               viewproj_matrix[3, 3] - viewproj_matrix[3, 1]]
-                # Near plane
-                downsampled_frustumplane[4] = [viewproj_matrix[0, 2],
-                                               viewproj_matrix[1, 2],
-                                               viewproj_matrix[2, 2],
-                                               viewproj_matrix[3, 2]]
-                # Far plane
-                downsampled_frustumplane[5] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
-                                               viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
-                                               viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
-                                               viewproj_matrix[3, 3] - viewproj_matrix[3, 2]]
-                downsampled_frustumplane = torch.tensor(downsampled_frustumplane, dtype=torch.float32, device='cuda').unsqueeze(0)
+
+                # Create as PyTorch tensor directly
+                downsampled_frustumplane = torch.zeros((6, 4), dtype=torch.float32, device='cuda')
+
+                # Fill the frustum planes
+                downsampled_frustumplane[0] = torch.tensor([
+                    viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
+                    viewproj_matrix[1, 3] + viewproj_matrix[1, 0], 
+                    viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
+                    viewproj_matrix[3, 3] + viewproj_matrix[3, 0]
+                ], device='cuda')
+
+                downsampled_frustumplane[1] = torch.tensor([
+                    viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
+                    viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
+                    viewproj_matrix[2, 3] - viewproj_matrix[2, 0], 
+                    viewproj_matrix[3, 3] - viewproj_matrix[3, 0]
+                ], device='cuda')
+
+                downsampled_frustumplane[2] = torch.tensor([
+                    viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
+                    viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
+                    viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
+                    viewproj_matrix[3, 3] + viewproj_matrix[3, 1]
+                ], device='cuda')
+
+                downsampled_frustumplane[3] = torch.tensor([
+                    viewproj_matrix[0, 3] - viewproj_matrix[0, 1], 
+                    viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
+                    viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
+                    viewproj_matrix[3, 3] - viewproj_matrix[3, 1]
+                ], device='cuda')
+
+                downsampled_frustumplane[4] = torch.tensor([
+                    viewproj_matrix[0, 2],
+                    viewproj_matrix[1, 2],
+                    viewproj_matrix[2, 2], 
+                    viewproj_matrix[3, 2]
+                ], device='cuda')
+
+                downsampled_frustumplane[5] = torch.tensor([
+                    viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
+                    viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
+                    viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
+                    viewproj_matrix[3, 3] - viewproj_matrix[3, 2]
+                ], device='cuda')
+
+                downsampled_frustumplane = downsampled_frustumplane.unsqueeze(0)
 
                 # Cluster culling with downsampled frustum
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,downsampled_frustumplane,
@@ -370,7 +387,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     gt_image,
                     target_height=ds_height,
                     target_width=ds_width,
-                    use_lanczos=True
                 )
 
                 # Compute loss on downsampled images
@@ -392,6 +408,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.step()
                     # proj_opt.zero_grad()
                 schedular.step()
+                 # Update scheduler with current iteration
+                resolution_scheduler.step(epoch)
 
                 # Debug visualization: save every 5 seconds
                 if pp.debug and debug_view_data is not None and resolution_scheduler is not None:
@@ -406,25 +424,31 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                     xyz, scale.exp(), torch.nn.functional.normalize(rot, dim=0)
                                 )
 
-                            # Render at full resolution
-                            _, culled_xyz, culled_scale, culled_rot, culled_sh_0, culled_sh_rest, culled_opacity = \
+                            # ========== FULL RESOLUTION RENDER (Top Left) ==========
+                            # Use ORIGINAL frustum plane for full resolution
+                            _, full_culled_xyz, full_culled_scale, full_culled_rot, full_culled_sh_0, full_culled_sh_rest, full_culled_opacity = \
                                 render.render_preprocess(
-                                    _cluster_origin, _cluster_extend, debug_view_data['frustumplane'],
+                                    _cluster_origin, _cluster_extend, debug_view_data['frustumplane'],  # ORIGINAL frustum
                                     xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
                                 )
 
+                            # Render at FULL resolution with ORIGINAL camera parameters
                             debug_render, _, _, _, _ = render.render(
-                                debug_view_data['view_matrix'], debug_view_data['proj_matrix'],
-                                culled_xyz, culled_scale, culled_rot, culled_sh_0, culled_sh_rest, culled_opacity,
-                                actived_sh_degree, debug_view_data['gt_image'].shape[2:], pp
+                                debug_view_data['view_matrix'], 
+                                debug_view_data['proj_matrix'],  # ORIGINAL projection matrix
+                                full_culled_xyz, full_culled_scale, full_culled_rot, full_culled_sh_0, full_culled_sh_rest, full_culled_opacity,
+                                actived_sh_degree, 
+                                debug_view_data['gt_image'].shape[2:],  # FULL resolution
+                                pp
                             )
 
+                            # ========== DOWNSAMPLED RENDER (Bottom Left) ==========
                             # Get downsampled resolution from scheduler with proper tile alignment
                             resolution_info = resolution_scheduler.get_info_dict()
                             full_height = debug_view_data['gt_image'].shape[2]
                             full_width = debug_view_data['gt_image'].shape[3]
                             ds_height, ds_width = resolution_scheduler.get_downsampled_dimensions(
-                                full_height, full_width, tile_h, tile_w
+                                full_height, full_width
                             )
 
                             # Create downsampled projection matrix
@@ -434,53 +458,73 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             )
                             downsampled_proj_matrix = torch.tensor(downsampled_proj_matrix_np, dtype=torch.float32, device='cuda').unsqueeze(0)
 
-                            # Create frustum plane for downsampled resolution
+                            # Create frustum plane for downsampled resolution as PyTorch tensor
                             view_matrix_np = debug_view_data['view_matrix'].cpu().numpy()[0]
                             viewproj_matrix = view_matrix_np @ downsampled_proj_matrix_np
-                            downsampled_frustumplane = np.zeros((6, 4), dtype=np.float32)
-                            # Left plane
-                            downsampled_frustumplane[0] = [viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
-                                                           viewproj_matrix[1, 3] + viewproj_matrix[1, 0],
-                                                           viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
-                                                           viewproj_matrix[3, 3] + viewproj_matrix[3, 0]]
-                            # Right plane
-                            downsampled_frustumplane[1] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
-                                                           viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
-                                                           viewproj_matrix[2, 3] - viewproj_matrix[2, 0],
-                                                           viewproj_matrix[3, 3] - viewproj_matrix[3, 0]]
-                            # Bottom plane
-                            downsampled_frustumplane[2] = [viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
-                                                           viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
-                                                           viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
-                                                           viewproj_matrix[3, 3] + viewproj_matrix[3, 1]]
-                            # Top plane
-                            downsampled_frustumplane[3] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 1],
-                                                           viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
-                                                           viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
-                                                           viewproj_matrix[3, 3] - viewproj_matrix[3, 1]]
-                            # Near plane
-                            downsampled_frustumplane[4] = [viewproj_matrix[0, 2],
-                                                           viewproj_matrix[1, 2],
-                                                           viewproj_matrix[2, 2],
-                                                           viewproj_matrix[3, 2]]
-                            # Far plane
-                            downsampled_frustumplane[5] = [viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
-                                                           viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
-                                                           viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
-                                                           viewproj_matrix[3, 3] - viewproj_matrix[3, 2]]
-                            downsampled_frustumplane = torch.tensor(downsampled_frustumplane, dtype=torch.float32, device='cuda').unsqueeze(0)
 
-                            # Render at downsampled resolution
+                            # Create as PyTorch tensor directly
+                            downsampled_frustumplane = torch.zeros((6, 4), dtype=torch.float32, device='cuda')
+
+                            # Fill the frustum planes
+                            downsampled_frustumplane[0] = torch.tensor([
+                                viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
+                                viewproj_matrix[1, 3] + viewproj_matrix[1, 0], 
+                                viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
+                                viewproj_matrix[3, 3] + viewproj_matrix[3, 0]
+                            ], device='cuda')
+
+                            downsampled_frustumplane[1] = torch.tensor([
+                                viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
+                                viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
+                                viewproj_matrix[2, 3] - viewproj_matrix[2, 0], 
+                                viewproj_matrix[3, 3] - viewproj_matrix[3, 0]
+                            ], device='cuda')
+
+                            downsampled_frustumplane[2] = torch.tensor([
+                                viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
+                                viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
+                                viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
+                                viewproj_matrix[3, 3] + viewproj_matrix[3, 1]
+                            ], device='cuda')
+
+                            downsampled_frustumplane[3] = torch.tensor([
+                                viewproj_matrix[0, 3] - viewproj_matrix[0, 1], 
+                                viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
+                                viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
+                                viewproj_matrix[3, 3] - viewproj_matrix[3, 1]
+                            ], device='cuda')
+
+                            downsampled_frustumplane[4] = torch.tensor([
+                                viewproj_matrix[0, 2],
+                                viewproj_matrix[1, 2],
+                                viewproj_matrix[2, 2], 
+                                viewproj_matrix[3, 2]
+                            ], device='cuda')
+
+                            downsampled_frustumplane[5] = torch.tensor([
+                                viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
+                                viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
+                                viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
+                                viewproj_matrix[3, 3] - viewproj_matrix[3, 2]
+                            ], device='cuda')
+
+                            downsampled_frustumplane = downsampled_frustumplane.unsqueeze(0)
+
+                            # Use DOWNsampled frustum for training resolution render
                             _, ds_culled_xyz, ds_culled_scale, ds_culled_rot, ds_culled_sh_0, ds_culled_sh_rest, ds_culled_opacity = \
                                 render.render_preprocess(
-                                    _cluster_origin, _cluster_extend, downsampled_frustumplane,
+                                    _cluster_origin, _cluster_extend, downsampled_frustumplane,  # DOWNsampled frustum
                                     xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
                                 )
 
+                            # Render at downsampled resolution
                             downsampled_render, _, _, _, _ = render.render(
-                                debug_view_data['view_matrix'], downsampled_proj_matrix,
+                                debug_view_data['view_matrix'], 
+                                downsampled_proj_matrix,  # DOWNsampled projection
                                 ds_culled_xyz, ds_culled_scale, ds_culled_rot, ds_culled_sh_0, ds_culled_sh_rest, ds_culled_opacity,
-                                actived_sh_degree, (ds_height, ds_width), pp
+                                actived_sh_degree, 
+                                (ds_height, ds_width),  # DOWNsampled resolution
+                                pp
                             )
 
                             # Downsample the GT image using high-quality method
@@ -488,15 +532,14 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 debug_view_data['gt_image'],
                                 target_height=ds_height,
                                 target_width=ds_width,
-                                use_lanczos=True
                             )
 
                             # Save the debug visualization
                             __save_debug_view(
                                 debug_dir, debug_iteration,
-                                debug_render[0], debug_view_data['gt_image'][0],
+                                debug_render[0], debug_view_data['gt_image'][0],  # Full res render vs full res GT
                                 debug_view_data['view_id'], debug_view_data['resolution'],
-                                downsampled_render[0], downsampled_gt[0],
+                                downsampled_render[0], downsampled_gt[0],  # Downsampled render vs downsampled GT
                                 resolution_info
                             )
 
