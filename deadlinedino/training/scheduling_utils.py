@@ -351,7 +351,20 @@ class ResolutionScheduler:
         self.reso_scales = None
         self.reso_level_significance = None
         self.reso_level_begin = None
-        self.increase_reso_until = getattr(opt, 'densify_until_iter', opt.iterations // 2)
+        
+        # FIX: Ensure increase_reso_until is valid BEFORE initializing scheduler
+        densify_until = getattr(opt, 'densify_until_iter', -1)
+        if densify_until <= 0:
+            self.increase_reso_until = opt.iterations // 2
+        else:
+            self.increase_reso_until = densify_until
+        
+        # Ensure we have a valid value
+        if self.increase_reso_until <= 0:
+            self.increase_reso_until = max(1, opt.iterations // 2)
+            
+        print(f"[ DEBUG ] opt.iterations={opt.iterations}, increase_reso_until={self.increase_reso_until}")
+        
         self.next_i = 2
         self.current_iteration = 0
 
@@ -373,61 +386,17 @@ class ResolutionScheduler:
             self._init_simple_scheduler()
             print("[ INFO ] Using paper-style resolution scheduler")
 
-    def _compute_win_significance(self, significance_map: torch.Tensor, scale: float) -> float:
-        """Compute frequency significance within a centered window."""
-        try:
-            h, w = significance_map.shape[-2:]
-            
-            # Ensure scale is valid
-            scale = max(1.0, min(scale, min(h, w)))
-            
-            c = (h // 2, w // 2)
-            win_height = max(1, int(h / scale))
-            win_width = max(1, int(w / scale))
-            
-            # Ensure window stays within bounds
-            start_h = max(0, c[0] - win_height // 2)
-            end_h = min(h, c[0] + win_height // 2)
-            start_w = max(0, c[1] - win_width // 2)
-            end_w = min(w, c[1] + win_width // 2)
-            
-            win_significance = significance_map[start_h:end_h, start_w:end_w].sum().item()
-            return win_significance
-        except Exception as e:
-            print(f"[ WARNING ] Window significance computation failed: {e}")
-            return significance_map.sum().item() / (scale * scale)  # Rough approximation
-
-    def _scale_solver(self, significance_map: torch.Tensor, target_significance: float) -> float:
-        """Binary search to find scale that captures target frequency significance."""
-        try:
-            L, R, T = 1.0, float(min(significance_map.shape[-2:])), 32
-            total_significance = significance_map.sum().item()
-            
-            # Ensure target is reasonable
-            target_significance = min(target_significance, total_significance * 0.99)
-            
-            for _ in range(T):
-                mid = (L + R) / 2
-                win_significance = self._compute_win_significance(significance_map, mid)
-                
-                if abs(win_significance - target_significance) < total_significance * 0.001:
-                    break
-                    
-                if win_significance < target_significance:
-                    L = mid
-                else:
-                    R = mid
-                    
-            return min(self.max_reso_scale, mid)  # Don't exceed max scale
-        except Exception as e:
-            print(f"[ WARNING ] Scale solver failed: {e}")
-            return self.max_reso_scale  # Fallback to max scale
-
     def _init_fft_scheduler(self, images: list):
-        """Initialize resolution scales based on FFT analysis of training images."""
+        """Initialize resolution scales based on FFT analysis of training images.
+        
+        Uses FFT to determine how quickly to ramp up from 1/5 resolution to full resolution
+        based on high-frequency content in the scene.
+        """
         print("[ INFO ] Initializing FFT-based resolution scheduler...")
 
         scene_freq_image = None
+        total_high_freq_energy = 0.0
+        total_energy = 0.0
 
         # Analyze frequency content of all images
         for img_idx, img in enumerate(images):
@@ -446,140 +415,138 @@ class ResolutionScheduler:
             # Handle different tensor formats
             if len(img.shape) == 3:  # (H, W, C) or (C, H, W)
                 if img.shape[0] in [1, 3]:  # (C, H, W)
-                    # Convert to (H, W, C) for consistent processing
                     img = img.permute(1, 2, 0)
-                # Now we have (H, W, C)
                 # Convert to grayscale for frequency analysis
                 if img.shape[2] == 3:
-                    # Use luminance formula for grayscale conversion
                     img_gray = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
                 else:
-                    img_gray = img[..., 0]  # Already single channel
+                    img_gray = img[..., 0]
             else:
                 raise ValueError(f"Unexpected image shape: {img.shape}")
-
-            # Add batch dimension for FFT
-            img_gray = img_gray.unsqueeze(0)  # (1, H, W)
 
             # Compute FFT
             try:
                 img_fft = torch.fft.fft2(img_gray)
                 img_fft_centered = torch.fft.fftshift(img_fft, dim=(-2, -1))
-                img_fft_centered_mod = torch.sqrt(img_fft_centered.real.pow(2) + img_fft_centered.imag.pow(2))
+                img_fft_magnitude = torch.sqrt(img_fft_centered.real.pow(2) + img_fft_centered.imag.pow(2))
                 
-                # Remove batch dimension
-                img_fft_centered_mod = img_fft_centered_mod.squeeze(0)
+                # Accumulate frequency maps
+                if scene_freq_image is None:
+                    scene_freq_image = img_fft_magnitude
+                else:
+                    if scene_freq_image.shape == img_fft_magnitude.shape:
+                        scene_freq_image = scene_freq_image + img_fft_magnitude
+                    else:
+                        print(f"[ WARNING ] Skipping image {img_idx} due to dimension mismatch")
+                        continue
+
+                # Compute high-frequency energy ratio
+                h, w = img_fft_magnitude.shape
+                center_h, center_w = h // 2, w // 2
+                
+                # Define high-frequency region: outer 40% of frequency space
+                high_freq_radius_h = int(h * 0.3)
+                high_freq_radius_w = int(w * 0.3)
+                
+                # Create mask for high frequencies (everything outside center region)
+                mask = torch.ones_like(img_fft_magnitude)
+                mask[center_h - high_freq_radius_h:center_h + high_freq_radius_h,
+                     center_w - high_freq_radius_w:center_w + high_freq_radius_w] = 0
+                
+                high_freq_energy = (img_fft_magnitude * mask).sum().item()
+                img_total_energy = img_fft_magnitude.sum().item()
+                
+                total_high_freq_energy += high_freq_energy
+                total_energy += img_total_energy
+                
             except Exception as e:
                 print(f"[ WARNING ] FFT failed for image {img_idx}: {e}")
                 continue
 
-            # Accumulate frequency maps
-            if scene_freq_image is None:
-                scene_freq_image = img_fft_centered_mod
-            else:
-                # Ensure dimensions match
-                if scene_freq_image.shape == img_fft_centered_mod.shape:
-                    scene_freq_image = scene_freq_image + img_fft_centered_mod
-                else:
-                    print(f"[ WARNING ] Skipping image {img_idx} due to dimension mismatch: "
-                        f"expected {scene_freq_image.shape}, got {img_fft_centered_mod.shape}")
-
-            # Determine max resolution scale for this image
-            try:
-                e_total = img_fft_centered_mod.sum().item()
-                e_min = e_total / self.start_significance_factor
-                current_max_scale = self._scale_solver(img_fft_centered_mod, e_min)
-                self.max_reso_scale = min(self.max_reso_scale, current_max_scale)
-            except Exception as e:
-                print(f"[ WARNING ] Scale solving failed for image {img_idx}: {e}")
-                continue
-
-        if scene_freq_image is None:
-            print("[ WARNING ] FFT analysis failed for all images, falling back to simple scheduler")
+        if scene_freq_image is None or total_energy == 0:
+            print("[ WARNING ] FFT analysis failed, falling back to simple scheduler")
             self._init_simple_scheduler()
             return
 
-        # Average frequency map across all images
-        scene_freq_image /= len(images)
+        # Compute high-frequency ratio for the scene
+        high_freq_ratio = total_high_freq_energy / total_energy
+        print(f"[ INFO ] Scene high-frequency ratio: {high_freq_ratio:.4f}")
 
-        # Compute resolution schedule based on frequency content
-        modulation_func = math.log
+        # Determine number of resolution stages based on high-frequency content
+        # More high-freq content → more stages → slower ramp up
+        # Less high-freq content → fewer stages → faster ramp up
+        if high_freq_ratio > 0.3:
+            # High detail scene: use 6 stages, ramp up slowly
+            num_stages = 6
+            print(f"[ INFO ] High-detail scene detected, using {num_stages} resolution stages")
+        elif high_freq_ratio > 0.15:
+            # Medium detail scene: use 5 stages
+            num_stages = 5
+            print(f"[ INFO ] Medium-detail scene detected, using {num_stages} resolution stages")
+        else:
+            # Low detail scene: use 4 stages, ramp up quickly
+            num_stages = 4
+            print(f"[ INFO ] Low-detail scene detected, using {num_stages} resolution stages")
 
-        self.reso_scales = []
-        self.reso_level_significance = []
-        self.reso_level_begin = []
-
-        E_total = scene_freq_image.sum().item()
+        # Always start at 1/5 resolution (minimum supported)
+        min_scale = 5.0
         
-        try:
-            E_min = self._compute_win_significance(scene_freq_image, self.max_reso_scale)
-        except Exception as e:
-            print(f"[ WARNING ] E_min computation failed: {e}, using fallback")
-            E_min = E_total / self.start_significance_factor
+        # Create resolution progression: 1/5 → 1/4 → 1/3 → 1/2 → 1/1
+        # For 6 stages: 1/5 → 1/4 → 1/3 → 1/2.5 → 1/2 → 1/1
+        # For 5 stages: 1/5 → 1/4 → 1/3 → 1/2 → 1/1
+        # For 4 stages: 1/5 → 1/3 → 1/2 → 1/1
+        
+        if num_stages == 6:
+            self.reso_scales = [5.0, 4.0, 3.0, 2.5, 2.0, 1.0]
+        elif num_stages == 5:
+            self.reso_scales = [5.0, 4.0, 3.0, 2.0, 1.0]
+        else:  # 4 stages
+            self.reso_scales = [5.0, 3.0, 2.0, 1.0]
 
-        # First level (lowest resolution)
-        self.reso_level_significance.append(E_min)
-        self.reso_scales.append(self.max_reso_scale)
-        self.reso_level_begin.append(0)
-
-        # Intermediate levels
-        for i in range(1, self.reso_sample_num - 1):
-            try:
-                significance = (E_total - E_min) * i / (self.reso_sample_num - 1) + E_min
-                self.reso_level_significance.append(significance)
-                scale = self._scale_solver(scene_freq_image, significance)
-                self.reso_scales.append(scale)
-
-                # Compute when this level should begin (in iterations)
-                modulated_sig = modulation_func(self.reso_level_significance[-2] / E_min)
-                self.reso_level_significance[-2] = modulated_sig
-                begin_iter = int(self.increase_reso_until * modulated_sig / modulation_func(E_total / E_min))
+        # Distribute stages across training iterations
+        # Use non-linear distribution: spend more time at lower resolutions for high-detail scenes
+        self.reso_level_begin = []
+        
+        if high_freq_ratio > 0.3:
+            # High detail: slower progression (more iterations at low res)
+            # Use exponential spacing
+            for i in range(num_stages):
+                # Exponential spacing: spend more time at beginning
+                progress = (i / (num_stages - 1)) ** 1.5  # Exponent > 1 → slower start
+                begin_iter = int(self.increase_reso_until * progress)
                 self.reso_level_begin.append(begin_iter)
-            except Exception as e:
-                print(f"[ WARNING ] Failed to compute level {i}: {e}")
-                # Add fallback level
-                fallback_scale = self.max_reso_scale * (1 - i/(self.reso_sample_num-1)) + 1.0 * (i/(self.reso_sample_num-1))
-                self.reso_scales.append(fallback_scale)
-                fallback_iter = int(self.increase_reso_until * i / (self.reso_sample_num - 1))
-                self.reso_level_begin.append(fallback_iter)
-
-        # Final level (full resolution)
-        try:
-            self.reso_level_significance.append(modulation_func(E_total / E_min))
-            self.reso_scales.append(1.0)
-            
-            # Update second-to-last significance
-            if len(self.reso_level_significance) >= 2:
-                self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
-                begin_iter = int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min))
+        elif high_freq_ratio > 0.15:
+            # Medium detail: linear progression
+            for i in range(num_stages):
+                begin_iter = int(self.increase_reso_until * i / (num_stages - 1))
                 self.reso_level_begin.append(begin_iter)
-            else:
-                self.reso_level_begin.append(self.increase_reso_until // 2)
-                
-        except Exception as e:
-            print(f"[ WARNING ] Final level computation failed: {e}")
-            self.reso_scales.append(1.0)
-            self.reso_level_begin.append(self.increase_reso_until)
+        else:
+            # Low detail: faster progression (less time at low res)
+            # Use square root spacing
+            for i in range(num_stages):
+                progress = (i / (num_stages - 1)) ** 0.7  # Exponent < 1 → faster start
+                begin_iter = int(self.increase_reso_until * progress)
+                self.reso_level_begin.append(begin_iter)
 
-        # Always add the final iteration
-        self.reso_level_begin.append(self.increase_reso_until)
-
+        # Ensure first stage starts at 0
+        self.reso_level_begin[0] = 0
+        
         # Ensure scales are in descending order and begin times are increasing
         self.reso_scales = sorted(self.reso_scales, reverse=True)
         self.reso_level_begin = sorted(self.reso_level_begin)
 
-        print(f"[ INFO ] FFT scheduler initialized with {len(self.reso_scales)} resolution levels")
-        print(f"[ INFO ] Max resolution scale: {self.max_reso_scale:.2f}")
-        print(f"[ INFO ] Resolution scales: {[f'{s:.2f}' for s in self.reso_scales]}")
-        print(f"[ INFO ] Level beginnings: {self.reso_level_begin}")
+        print(f"[ INFO ] FFT scheduler initialized with {len(self.reso_scales)} resolution stages")
+        print(f"[ INFO ] Resolution scales: {[f'1/{s:.1f}' for s in self.reso_scales]}")
+        print(f"[ INFO ] Stage begin iterations: {self.reso_level_begin}")
+        print(f"[ INFO ] Resolution will increase until iteration: {self.increase_reso_until}")
 
     def _init_simple_scheduler(self):
         """Use paper's resolution progression: 1/5, 1/4, 1/3, 1/2, 1/1"""
         print("[ INFO ] Initializing paper-style resolution scheduler...")
         
-        # Fix the increase_reso_until value
+        # Fix the increase_reso_until value if needed
         if self.increase_reso_until <= 0:
-            self.increase_reso_until = self.opt.iterations // 2
+            self.increase_reso_until = max(1, self.opt.iterations // 2)
             print(f"[ INFO ] Fixed increase_reso_until to: {self.increase_reso_until}")
         
         # Paper's progression: 1/5, 1/4, 1/3, 1/2, 1/1 (larger minimum resolution)
@@ -589,7 +556,7 @@ class ResolutionScheduler:
         # Distribute stages evenly across training
         self.reso_level_begin = []
         for i in range(num_stages):
-            begin_iter = int(self.increase_reso_until * i / num_stages)
+            begin_iter = int(self.increase_reso_until * i / (num_stages - 1))
             self.reso_level_begin.append(begin_iter)
         
         print(f"[ INFO ] Paper scheduler: scales {self.reso_scales}, begins {self.reso_level_begin}")
@@ -608,7 +575,7 @@ class ResolutionScheduler:
         if iteration >= self.increase_reso_until:
             return 1.0
         
-        if iteration < self.reso_level_begin[1]:
+        if len(self.reso_level_begin) < 2 or iteration < self.reso_level_begin[1]:
             return 1.0 / self.reso_scales[0]
         
         # Update next_i to current position
@@ -621,10 +588,19 @@ class ResolutionScheduler:
 
         # Interpolate between resolution levels (DashGaussian style)
         i = self.next_i - 1
+        if i + 1 >= len(self.reso_level_begin):
+            return 1.0
+            
         i_now, i_nxt = self.reso_level_begin[i: i + 2]
+        if i < 1 or i >= len(self.reso_scales):
+            return 1.0
+            
         s_lst, s_now = self.reso_scales[i - 1: i + 1]
 
         # Smooth interpolation in frequency space
+        if i_nxt == i_now:  # Avoid division by zero
+            return 1.0 / s_now
+            
         scale = (1 / ((iteration - i_now) / (i_nxt - i_now) * (1/s_now**2 - 1/s_lst**2) + 1/s_lst**2))**0.5
         return 1.0 / scale
 
@@ -657,12 +633,6 @@ class ResolutionScheduler:
         # Ensure we don't exceed original dimensions
         downsampled_height = min(downsampled_height, full_height)
         downsampled_width = min(downsampled_width, full_width)
-
-        # # Debug output
-        # if self.current_iteration == 0:
-        #     print(f"[ DEBUG ] Downsampled: {downsampled_height}x{downsampled_width}, "
-        #         f"Tiles: {downsampled_height//self.tile_height}x{downsampled_width//self.tile_width}, "
-        #         f"Scale: {scale:.3f}")
 
         return downsampled_height, downsampled_width
 
