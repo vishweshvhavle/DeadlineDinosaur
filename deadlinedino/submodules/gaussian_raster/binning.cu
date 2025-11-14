@@ -141,8 +141,8 @@ template<int TileSizeY, int TileSizeX>
     auto table_pointId= torch::empty(output_shape, opt);
     auto table_pointId_sorted = torch::empty(output_shape, opt);
 
-    dim3 Block3d(std::ceil(points_num/256.0f), view_num, 1);
-    
+    dim3 Block3d(std::max(1, (int)std::ceil(points_num/256.0f)), view_num, 1);
+
     if (tile_size_h == 8 && tile_size_w == 16)
     {
         LAUNCH_DUPLICATE_WITH_KEYS_KERNEL(8,16);
@@ -234,7 +234,7 @@ at::Tensor tileRange(at::Tensor table_tileId, int64_t table_length, int64_t max_
     auto opt = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(table_tileId.device()).requires_grad(false);
     auto out = torch::ones(output_shape, opt)*-1;
 
-    dim3 Block3d(std::ceil(table_length / 512.0f), view_num, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(table_length / 512.0f)), view_num, 1);
 
     tile_range_kernel<<<Block3d, 512 >>>
         (table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(), table_length, max_tileId, out.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
@@ -363,7 +363,7 @@ std::vector<at::Tensor> get_allocate_size(at::Tensor ndc, at::Tensor view_space_
     at::Tensor right_down = torch::empty({ views_num,2,points_num }, ndc.options().dtype(torch::kInt32));
     at::Tensor allocated_size = torch::empty({ views_num,points_num }, ndc.options().dtype(torch::kInt32));
 
-    dim3 Block3d(std::ceil(points_num / 256.0f), views_num, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(points_num / 256.0f)), views_num, 1);
     if (tile_size_h == 8 && tile_size_w == 16)
     {
         LAUNCH_GET_ALLOCATE_SIZE_KERNEL(8,16);

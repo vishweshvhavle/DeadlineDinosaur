@@ -69,7 +69,7 @@ at::Tensor jacobianRayspace(
     at::Tensor jacobian_matrix = torch::zeros({N,3,3,P}, translated_position.options());
 
     int threadsnum = 256;
-    dim3 Block3d(std::ceil(P/(float)threadsnum), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P/(float)threadsnum)), N, 1);
     if (bTranspose)
     {
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(translated_position.TYPE(), __FUNCTION__, [&] {jacobian_rayspace_kernel<scalar_t,true > << <Block3d, threadsnum >> > (
@@ -416,7 +416,7 @@ std::vector<at::Tensor> world2ndc_forward(at::Tensor world_position,at::Tensor v
     at::Tensor repc_hom_w = torch::empty({ N,1,P }, world_position.options());
 
     int threadsnum = 256;
-    dim3 Block3d(std::ceil(P / 256.0f), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P / 256.0f)), N, 1);
 
     world2ndc_forward_kernel << <Block3d, threadsnum >> > (
         view_project_matrix.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
@@ -552,7 +552,7 @@ at::Tensor createCov2dDirectly_forward(
     at::Tensor cov2d = torch::empty({ N,2,2,P }, transform_matrix.options());
 
     int threadsnum = 512;
-    dim3 Block3d(std::ceil(P / (float)threadsnum), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P / (float)threadsnum)), N, 1);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(transform_matrix.TYPE(), __FUNCTION__, [&] {
         create_cov2d_forward<scalar_t> << <Block3d, threadsnum >> > (
@@ -786,7 +786,7 @@ at::Tensor sh2rgb_forward(int64_t degree, at::Tensor sh_base, at::Tensor sh_rest
     at::Tensor rgb = torch::empty({ N,3,P }, sh_base.options());
 
     int threadsnum = 512;
-    dim3 Block3d(std::ceil(P / (float)threadsnum), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P / (float)threadsnum)), N, 1);
 
     switch (degree)
     {
@@ -1204,7 +1204,7 @@ std::vector<at::Tensor> eigh_and_inv_2x2matrix_forward(at::Tensor input)
     at::Tensor inv = torch::empty({ N,2,2,P }, input.options());
 
     int threadsnum = 512;
-    dim3 Block3d(std::ceil(P / (float)threadsnum), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P / (float)threadsnum)), N, 1);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.TYPE(), __FUNCTION__, [&] {eigh_and_inv_2x2matrix_kernel_forward<scalar_t > << <Block3d, threadsnum >> > (
         input.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
@@ -1222,7 +1222,7 @@ at::Tensor inv_2x2matrix_backward(at::Tensor inv_matrix,at::Tensor dL_dInvMatrix
     at::Tensor dL_dMatrix = torch::empty_like(dL_dInvMatrix);
 
     int threadsnum = 512;
-    dim3 Block3d(std::ceil(P / (float)threadsnum), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P / (float)threadsnum)), N, 1);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(inv_matrix.TYPE(), __FUNCTION__, [&] {inv_2x2matrix_kernel_backward<scalar_t > << <Block3d, threadsnum >> > (
         inv_matrix.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
