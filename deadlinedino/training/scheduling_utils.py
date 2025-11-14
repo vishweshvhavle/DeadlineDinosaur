@@ -283,6 +283,22 @@ class ResolutionScheduler:
         # Smooth interpolation in frequency space
         scale = (1 / ((elapsed - i_now) / (i_nxt - i_now) * (1/s_now**2 - 1/s_lst**2) + 1/s_lst**2))**0.5
         return 1.0 / scale
+    
+    def get_downsampled_dimensions(self, full_height, full_width, tile_height=8, tile_width=16):
+        """Ensures dimensions are compatible with CUDA tile-based rendering"""
+        scale = self.get_resolution_scale()
+        ds_height = int(full_height * scale)
+        ds_width = int(full_width * scale)
+        
+        # Minimum: 2x tile size
+        ds_height = max(tile_height * 2, ds_height)
+        ds_width = max(tile_width * 2, ds_width)
+        
+        # Round to tile multiples
+        ds_height = ((ds_height + tile_height - 1) // tile_height) * tile_height
+        ds_width = ((ds_width + tile_width - 1) // tile_width) * tile_width
+        
+        return ds_height, ds_width
 
     def get_downsampled_shape(self, full_height: int, full_width: int,
                               tile_height: int = 8, tile_width: int = 16) -> tuple[int, int]:

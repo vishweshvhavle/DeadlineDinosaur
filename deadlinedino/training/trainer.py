@@ -26,6 +26,7 @@ from .scheduling_utils import ResolutionScheduler
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
 
+
 def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_resolution,
                      downsampled_render_img=None, downsampled_gt_img=None, resolution_info=None):
     """Save debug visualization with render and GT, plus optional downsampled versions"""
@@ -298,10 +299,20 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     proj_matrix[:,0,0]=focal_x
                     proj_matrix[:,1,1]=focal_y
 
-                # Get downsampled resolution from scheduler
+                # Get tile size
+                tile_h, tile_w = pp.tile_size if isinstance(pp.tile_size, tuple) else (pp.tile_size, pp.tile_size)
+                
+                # Get downsampled resolution with proper tile alignment
                 full_height = gt_image.shape[2]
                 full_width = gt_image.shape[3]
-                ds_height, ds_width = resolution_scheduler.get_downsampled_shape(full_height, full_width)
+                ds_height, ds_width = resolution_scheduler.get_downsampled_dimensions(
+                    full_height, full_width, tile_h, tile_w
+                )
+
+                # Debug logging
+                if pp.debug and epoch == start_epoch:
+                    print(f"DEBUG: full={full_height}x{full_width}, ds={ds_height}x{ds_width}, tile={tile_h}x{tile_w}")
+                    print(f"DEBUG: tiles={ds_height//tile_h}x{ds_width//tile_w}")
 
                 # Create downsampled projection matrix
                 proj_matrix_np = proj_matrix.cpu().numpy()[0]
@@ -349,7 +360,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 # Cluster culling with downsampled frustum
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,downsampled_frustumplane,
                                                                                                                xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
-
+                
                 # Render at downsampled resolution
                 img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,downsampled_proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
                                                             actived_sh_degree,(ds_height, ds_width),pp)
@@ -408,11 +419,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 actived_sh_degree, debug_view_data['gt_image'].shape[2:], pp
                             )
 
-                            # Get downsampled resolution from scheduler
+                            # Get downsampled resolution from scheduler with proper tile alignment
                             resolution_info = resolution_scheduler.get_info_dict()
                             full_height = debug_view_data['gt_image'].shape[2]
                             full_width = debug_view_data['gt_image'].shape[3]
-                            ds_height, ds_width = resolution_scheduler.get_downsampled_shape(full_height, full_width)
+                            ds_height, ds_width = resolution_scheduler.get_downsampled_dimensions(
+                                full_height, full_width, tile_h, tile_w
+                            )
 
                             # Create downsampled projection matrix
                             proj_matrix_np = debug_view_data['proj_matrix'].cpu().numpy()[0]
