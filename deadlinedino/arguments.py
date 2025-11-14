@@ -76,6 +76,9 @@ class PipelineParams(ParamGroup):
     enable_depth=False
     input_color_type='sh'#'rgb' or 'sh'
     debug = False
+    densify_mode = 'freq'  # 'freq' or 'free'
+    resolution_mode = 'freq'  # 'freq' or 'const'
+    max_n_gaussian = -1  # Maximum number of Gaussians (-1 for auto)
     def __init__(self, parser):
         super().__init__(parser, "Pipeline Parameters")
 
@@ -84,6 +87,7 @@ class OptimizationParams(ParamGroup):
     position_lr_init = 0.00016
     position_lr_final = 0.0000016
     position_lr_max_steps = 30000
+    position_lr_delay_mult = 0.01
     feature_lr = 0.0025
     opacity_lr = 0.025
     scaling_lr = 0.005
@@ -91,6 +95,8 @@ class OptimizationParams(ParamGroup):
     lambda_dssim = 0.2
     reg_weight = 0.0
     learnable_viewproj = False
+    densify_until_iter = -1  # Auto-set to iterations // 2 if -1
+    densification_interval = 100
     def __init__(self, parser):
         super().__init__(parser, "Optimization Parameters")
 
