@@ -551,11 +551,11 @@ class ResolutionScheduler:
         downsampled_height = min(downsampled_height, full_height)
         downsampled_width = min(downsampled_width, full_width)
 
-        # Debug output
-        if self.current_iteration == 0:
-            print(f"[ DEBUG ] Downsampled: {downsampled_height}x{downsampled_width}, "
-                f"Tiles: {downsampled_height//self.tile_height}x{downsampled_width//self.tile_width}, "
-                f"Scale: {scale:.3f}")
+        # # Debug output
+        # if self.current_iteration == 0:
+        #     print(f"[ DEBUG ] Downsampled: {downsampled_height}x{downsampled_width}, "
+        #         f"Tiles: {downsampled_height//self.tile_height}x{downsampled_width//self.tile_width}, "
+        #         f"Scale: {scale:.3f}")
 
         return downsampled_height, downsampled_width
 
@@ -575,9 +575,11 @@ class ResolutionScheduler:
         scale = self.get_resolution_scale()
         downsampled_proj = proj_matrix.copy()
         
-        # Scale focal lengths to maintain field of view
-        downsampled_proj[0, 0] = proj_matrix[0, 0] / scale  # focal_x
-        downsampled_proj[1, 1] = proj_matrix[1, 1] / scale  # focal_y
+        # Scale principal points
+        if abs(proj_matrix[0, 2]) > 1e-6:
+            downsampled_proj[0, 2] = proj_matrix[0, 2] * scale
+        if abs(proj_matrix[1, 2]) > 1e-6:
+            downsampled_proj[1, 2] = proj_matrix[1, 2] * scale
         
         return downsampled_proj
 
