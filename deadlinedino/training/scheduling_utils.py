@@ -327,7 +327,7 @@ class ResolutionScheduler:
     """
 
     def __init__(self, opt, pipe, original_images: list = None, 
-                 tile_height: int = 8, tile_width: int = 16):
+                tile_height: int = 8, tile_width: int = 16):
         """
         Initialize the resolution scheduler.
 
@@ -356,38 +356,72 @@ class ResolutionScheduler:
         self.current_iteration = 0
 
         # Initialize based on mode
-        if self.resolution_mode == "freq" and original_images is not None:
-            self._init_fft_scheduler(original_images)
+        if self.resolution_mode == "freq" and original_images is not None and len(original_images) > 0:
+            try:
+                self._init_fft_scheduler(original_images)
+                print("[ INFO ] Successfully initialized FFT-based resolution scheduler")
+            except Exception as e:
+                print(f"[ WARNING ] FFT scheduler initialization failed: {e}")
+                print("[ INFO ] Falling back to paper-style scheduler")
+                self._init_simple_scheduler()
         elif self.resolution_mode == "const":
             self.reso_scales = [1]
             self.reso_level_begin = [0]
+            print("[ INFO ] Using constant resolution (full res)")
         else:
             # Fallback to simple progression
             self._init_simple_scheduler()
+            print("[ INFO ] Using paper-style resolution scheduler")
 
     def _compute_win_significance(self, significance_map: torch.Tensor, scale: float) -> float:
         """Compute frequency significance within a centered window."""
-        h, w = significance_map.shape[-2:]
-        c = ((h + 1) // 2, (w + 1) // 2)
-        win_size = (int(h / scale), int(w / scale))
-        win_significance = significance_map[
-            ...,
-            c[0] - win_size[0] // 2: c[0] + win_size[0] // 2,
-            c[1] - win_size[1] // 2: c[1] + win_size[1] // 2
-        ].sum().item()
-        return win_significance
+        try:
+            h, w = significance_map.shape[-2:]
+            
+            # Ensure scale is valid
+            scale = max(1.0, min(scale, min(h, w)))
+            
+            c = (h // 2, w // 2)
+            win_height = max(1, int(h / scale))
+            win_width = max(1, int(w / scale))
+            
+            # Ensure window stays within bounds
+            start_h = max(0, c[0] - win_height // 2)
+            end_h = min(h, c[0] + win_height // 2)
+            start_w = max(0, c[1] - win_width // 2)
+            end_w = min(w, c[1] + win_width // 2)
+            
+            win_significance = significance_map[start_h:end_h, start_w:end_w].sum().item()
+            return win_significance
+        except Exception as e:
+            print(f"[ WARNING ] Window significance computation failed: {e}")
+            return significance_map.sum().item() / (scale * scale)  # Rough approximation
 
     def _scale_solver(self, significance_map: torch.Tensor, target_significance: float) -> float:
         """Binary search to find scale that captures target frequency significance."""
-        L, R, T = 0., 1., 64
-        for _ in range(T):
-            mid = (L + R) / 2
-            win_significance = self._compute_win_significance(significance_map, 1 / mid)
-            if win_significance < target_significance:
-                L = mid
-            else:
-                R = mid
-        return 1 / mid
+        try:
+            L, R, T = 1.0, float(min(significance_map.shape[-2:])), 32
+            total_significance = significance_map.sum().item()
+            
+            # Ensure target is reasonable
+            target_significance = min(target_significance, total_significance * 0.99)
+            
+            for _ in range(T):
+                mid = (L + R) / 2
+                win_significance = self._compute_win_significance(significance_map, mid)
+                
+                if abs(win_significance - target_significance) < total_significance * 0.001:
+                    break
+                    
+                if win_significance < target_significance:
+                    L = mid
+                else:
+                    R = mid
+                    
+            return min(self.max_reso_scale, mid)  # Don't exceed max scale
+        except Exception as e:
+            print(f"[ WARNING ] Scale solver failed: {e}")
+            return self.max_reso_scale  # Fallback to max scale
 
     def _init_fft_scheduler(self, images: list):
         """Initialize resolution scales based on FFT analysis of training images."""
@@ -396,33 +430,74 @@ class ResolutionScheduler:
         scene_freq_image = None
 
         # Analyze frequency content of all images
-        for img in images:
+        for img_idx, img in enumerate(images):
             # Convert to torch tensor if needed
             if isinstance(img, np.ndarray):
                 img = torch.from_numpy(img)
 
             # Ensure image is on GPU for faster FFT
-            if not img.is_cuda:
+            if torch.cuda.is_available() and not img.is_cuda:
                 img = img.cuda()
 
-            # Ensure image is float
+            # Ensure image is float and in correct format
             if img.dtype == torch.uint8:
                 img = img.float() / 255.0
 
+            # Handle different tensor formats
+            if len(img.shape) == 3:  # (H, W, C) or (C, H, W)
+                if img.shape[0] in [1, 3]:  # (C, H, W)
+                    # Convert to (H, W, C) for consistent processing
+                    img = img.permute(1, 2, 0)
+                # Now we have (H, W, C)
+                # Convert to grayscale for frequency analysis
+                if img.shape[2] == 3:
+                    # Use luminance formula for grayscale conversion
+                    img_gray = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
+                else:
+                    img_gray = img[..., 0]  # Already single channel
+            else:
+                raise ValueError(f"Unexpected image shape: {img.shape}")
+
+            # Add batch dimension for FFT
+            img_gray = img_gray.unsqueeze(0)  # (1, H, W)
+
             # Compute FFT
-            img_fft_centered = torch.fft.fftshift(torch.fft.fft2(img), dim=(-2, -1))
-            img_fft_centered_mod = (img_fft_centered.real.square() + img_fft_centered.imag.square()).sqrt()
+            try:
+                img_fft = torch.fft.fft2(img_gray)
+                img_fft_centered = torch.fft.fftshift(img_fft, dim=(-2, -1))
+                img_fft_centered_mod = torch.sqrt(img_fft_centered.real.pow(2) + img_fft_centered.imag.pow(2))
+                
+                # Remove batch dimension
+                img_fft_centered_mod = img_fft_centered_mod.squeeze(0)
+            except Exception as e:
+                print(f"[ WARNING ] FFT failed for image {img_idx}: {e}")
+                continue
 
             # Accumulate frequency maps
             if scene_freq_image is None:
                 scene_freq_image = img_fft_centered_mod
             else:
-                scene_freq_image = scene_freq_image + img_fft_centered_mod
+                # Ensure dimensions match
+                if scene_freq_image.shape == img_fft_centered_mod.shape:
+                    scene_freq_image = scene_freq_image + img_fft_centered_mod
+                else:
+                    print(f"[ WARNING ] Skipping image {img_idx} due to dimension mismatch: "
+                        f"expected {scene_freq_image.shape}, got {img_fft_centered_mod.shape}")
 
             # Determine max resolution scale for this image
-            e_total = img_fft_centered_mod.sum().item()
-            e_min = e_total / self.start_significance_factor
-            self.max_reso_scale = min(self.max_reso_scale, self._scale_solver(img_fft_centered_mod, e_min))
+            try:
+                e_total = img_fft_centered_mod.sum().item()
+                e_min = e_total / self.start_significance_factor
+                current_max_scale = self._scale_solver(img_fft_centered_mod, e_min)
+                self.max_reso_scale = min(self.max_reso_scale, current_max_scale)
+            except Exception as e:
+                print(f"[ WARNING ] Scale solving failed for image {img_idx}: {e}")
+                continue
+
+        if scene_freq_image is None:
+            print("[ WARNING ] FFT analysis failed for all images, falling back to simple scheduler")
+            self._init_simple_scheduler()
+            return
 
         # Average frequency map across all images
         scene_freq_image /= len(images)
@@ -435,7 +510,12 @@ class ResolutionScheduler:
         self.reso_level_begin = []
 
         E_total = scene_freq_image.sum().item()
-        E_min = self._compute_win_significance(scene_freq_image, self.max_reso_scale)
+        
+        try:
+            E_min = self._compute_win_significance(scene_freq_image, self.max_reso_scale)
+        except Exception as e:
+            print(f"[ WARNING ] E_min computation failed: {e}, using fallback")
+            E_min = E_total / self.start_significance_factor
 
         # First level (lowest resolution)
         self.reso_level_significance.append(E_min)
@@ -444,27 +524,54 @@ class ResolutionScheduler:
 
         # Intermediate levels
         for i in range(1, self.reso_sample_num - 1):
-            significance = (E_total - E_min) * i / (self.reso_sample_num - 1) + E_min
-            self.reso_level_significance.append(significance)
-            self.reso_scales.append(self._scale_solver(scene_freq_image, significance))
+            try:
+                significance = (E_total - E_min) * i / (self.reso_sample_num - 1) + E_min
+                self.reso_level_significance.append(significance)
+                scale = self._scale_solver(scene_freq_image, significance)
+                self.reso_scales.append(scale)
 
-            # Compute when this level should begin (in iterations)
-            self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
-            self.reso_level_begin.append(
-                int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min))
-            )
+                # Compute when this level should begin (in iterations)
+                modulated_sig = modulation_func(self.reso_level_significance[-2] / E_min)
+                self.reso_level_significance[-2] = modulated_sig
+                begin_iter = int(self.increase_reso_until * modulated_sig / modulation_func(E_total / E_min))
+                self.reso_level_begin.append(begin_iter)
+            except Exception as e:
+                print(f"[ WARNING ] Failed to compute level {i}: {e}")
+                # Add fallback level
+                fallback_scale = self.max_reso_scale * (1 - i/(self.reso_sample_num-1)) + 1.0 * (i/(self.reso_sample_num-1))
+                self.reso_scales.append(fallback_scale)
+                fallback_iter = int(self.increase_reso_until * i / (self.reso_sample_num - 1))
+                self.reso_level_begin.append(fallback_iter)
 
         # Final level (full resolution)
-        self.reso_level_significance.append(modulation_func(E_total / E_min))
-        self.reso_scales.append(1.)
-        self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
-        self.reso_level_begin.append(
-            int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min))
-        )
+        try:
+            self.reso_level_significance.append(modulation_func(E_total / E_min))
+            self.reso_scales.append(1.0)
+            
+            # Update second-to-last significance
+            if len(self.reso_level_significance) >= 2:
+                self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
+                begin_iter = int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min))
+                self.reso_level_begin.append(begin_iter)
+            else:
+                self.reso_level_begin.append(self.increase_reso_until // 2)
+                
+        except Exception as e:
+            print(f"[ WARNING ] Final level computation failed: {e}")
+            self.reso_scales.append(1.0)
+            self.reso_level_begin.append(self.increase_reso_until)
+
+        # Always add the final iteration
         self.reso_level_begin.append(self.increase_reso_until)
+
+        # Ensure scales are in descending order and begin times are increasing
+        self.reso_scales = sorted(self.reso_scales, reverse=True)
+        self.reso_level_begin = sorted(self.reso_level_begin)
 
         print(f"[ INFO ] FFT scheduler initialized with {len(self.reso_scales)} resolution levels")
         print(f"[ INFO ] Max resolution scale: {self.max_reso_scale:.2f}")
+        print(f"[ INFO ] Resolution scales: {[f'{s:.2f}' for s in self.reso_scales]}")
+        print(f"[ INFO ] Level beginnings: {self.reso_level_begin}")
 
     def _init_simple_scheduler(self):
         """Use paper's resolution progression: 1/5, 1/4, 1/3, 1/2, 1/1"""

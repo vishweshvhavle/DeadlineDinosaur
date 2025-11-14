@@ -237,7 +237,39 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
     # Initialize resolution scheduler (always needed, not just for debug mode)
     # resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
-    resolution_scheduler = ResolutionScheduler(op, pp, original_images=None)
+    # Load original training images for FFT analysis
+    original_images = []
+    print(f"[ INFO ] Loading {len(training_frames)} training images for FFT analysis...")
+
+    for i, frame in enumerate(training_frames):
+        try:
+            # Load image at full resolution
+            img = frame.load_image(1.0)  # 1.0 means full resolution
+            
+            # Convert to proper format
+            if isinstance(img, torch.Tensor):
+                if img.dim() == 3 and img.shape[0] in [1, 3]:  # (C, H, W)
+                    img = img.permute(1, 2, 0)  # Convert to (H, W, C)
+                img = img.cpu().numpy()
+            
+            # Ensure it's in uint8 format
+            if img.dtype == np.float32 or img.dtype == np.float64:
+                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+                
+            original_images.append(img)
+            
+            if i < 3:  # Debug: print first few images
+                print(f"[ DEBUG ] Image {i}: shape={img.shape}, dtype={img.dtype}")
+                
+        except Exception as e:
+            print(f"[ WARNING ] Failed to load image {i}: {e}")
+            continue
+
+    print(f"[ INFO ] Successfully loaded {len(original_images)} images for FFT analysis")
+
+    # Initialize resolution scheduler
+    resolution_scheduler = ResolutionScheduler(op, pp, original_images=original_images)
+    # resolution_scheduler = ResolutionScheduler(op, pp, original_images=None)
     if pp.debug:
         print(f"Resolution scheduler initialized with mode: {resolution_scheduler.resolution_mode}")
 
