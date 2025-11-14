@@ -329,22 +329,21 @@ class ResolutionScheduler:
     Uses FFT-based frequency analysis to determine optimal resolution scales based on image content.
     Supports both time-based progression and frequency-aware initialization.
 
-    The resolution increases in discrete steps based on elapsed time:
-    - 0-9s: 1/6 resolution
-    - 9-18s: 2/6 resolution
-    - 18-27s: 3/6 resolution
-    - 27-36s: 4/6 resolution
-    - 36-45s: 5/6 resolution
-    - 45s+: 6/6 (full) resolution
+    The resolution increases in discrete steps based on elapsed time following the paper's approach:
+    - 0-9s: 1/5 (20%) resolution
+    - 9-18s: 1/4 (25%) resolution
+    - 18-27s: 1/3 (33%) resolution
+    - 27-36s: 1/2 (50%) resolution
+    - 36s+: 1/1 (100%) full resolution
     """
 
-    def __init__(self, num_stages: int = 6, stage_duration: float = 9.0,
+    def __init__(self, num_stages: int = 5, stage_duration: float = 9.0,
                  use_fft_analysis: bool = False, images: list = None):
         """
         Initialize the resolution scheduler.
 
         Args:
-            num_stages: Number of resolution stages (default: 6)
+            num_stages: Number of resolution stages (default: 5 for 1/5, 1/4, 1/3, 1/2, 1/1 progression)
             stage_duration: Duration of each stage in seconds (default: 9.0)
             use_fft_analysis: Whether to use FFT-based frequency analysis (default: False)
             images: List of training images for FFT analysis (required if use_fft_analysis=True)
@@ -522,16 +521,23 @@ class ResolutionScheduler:
         """
         Get the current resolution scale factor.
 
-        Uses FFT-based scales if initialized, otherwise uses time-based stages.
+        Uses FFT-based scales if initialized, otherwise uses time-based stages
+        following the paper's progression: 1/5, 1/4, 1/3, 1/2, 1/1.
 
         Returns:
-            Resolution scale (e.g., 1/6, 2/6, ..., 6/6)
+            Resolution scale (e.g., 1/5, 1/4, 1/3, 1/2, 1/1)
         """
         if self.use_fft_analysis and self.reso_scales is not None:
             return self._get_fft_resolution_scale()
         else:
             stage = self.get_current_stage()
-            return stage / self.num_stages
+            # Paper's progression: 1/5, 1/4, 1/3, 1/2, 1/1
+            # Stage 1 → 1/5, Stage 2 → 1/4, Stage 3 → 1/3, Stage 4 → 1/2, Stage 5 → 1/1
+            progression = [1/5, 1/4, 1/3, 1/2, 1.0]
+            if stage <= len(progression):
+                return progression[stage - 1]
+            else:
+                return 1.0  # Full resolution for any stage beyond the progression
 
     def _get_fft_resolution_scale(self) -> float:
         """
