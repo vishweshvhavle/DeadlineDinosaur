@@ -285,8 +285,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         elapsed_time = time.time() - training_start_time
         if elapsed_time >= 59.5:
             progress_bar.close()
-            print(f"Training stopped at {elapsed_time:.2f}s (target: 59.5s) at epoch {epoch}")
-
+            
             # Save the most recent .ply file
             save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
 

@@ -3,6 +3,9 @@ import sys
 import argparse
 from datetime import datetime
 from natsort import natsorted
+from tqdm import tqdm
+import subprocess
+import tempfile
 
 def run_pipeline(args):
     # Find scene folders
@@ -59,30 +62,37 @@ def run_pipeline(args):
         scene_name = os.path.basename(source_path)
         model_path = os.path.join(output_dir, scene_name)
 
-        cmd = f"python example_metrics.py -s {source_path} -m {model_path} {metrics_config}"
-        import subprocess
-        process = subprocess.Popen(
-            cmd.split(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = process.communicate()
-
-        if process.returncode != 0:
-            print(f"Error computing metrics for {scene_name}:")
-            print(stderr)
+        print(f"\n[Metrics] Processing: {scene_name}")
+        
+        # Create temp file for output
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as tmp:
+            tmp_path = tmp.name
+        
+        cmd = f"python example_metrics.py -s {source_path} -m {model_path} {metrics_config} | tee {tmp_path}"
+        
+        # Run command - tqdm will display, output will be saved to temp file
+        result = os.system(cmd)
+        
+        if result != 0:
+            print(f"Error computing metrics for {scene_name}")
+            os.unlink(tmp_path)
             continue
 
-        idx = stdout.find('  PSNR : ')
+        # Read PSNR from temp file
+        with open(tmp_path, 'r') as f:
+            output = f.read()
+        
+        os.unlink(tmp_path)
+        
+        idx = output.find('  PSNR : ')
         if idx != -1:
-            end = stdout[idx+9:].find('\n')
-            psnr = float(stdout[idx+9:idx+9+end])
+            end = output[idx+9:].find('\n')
+            psnr = float(output[idx+9:idx+9+end])
             results.append(psnr)
-            print(f"{scene_name}: PSNR = {psnr:.2f}")
+            print(f"  → {scene_name}: PSNR = {psnr:.2f}")
         else:
-            print(f"Could not parse PSNR for {scene_name}")
-    
+            print(f"  → Could not parse PSNR for {scene_name}")
+        
     if results:
         import numpy as np
         print(f"\nAverage PSNR: {np.mean(results):.2f}")
