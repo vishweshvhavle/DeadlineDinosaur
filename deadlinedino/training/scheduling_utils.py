@@ -169,35 +169,18 @@ class TrainingScheduler:
         raise Exception("Something is wrong with resolution scheduler.")
 
     def init_reso_scheduler(self, original_images):
-        """
-        Initialize resolution scheduler based on FFT analysis of training images.
-
-        This method analyzes the frequency content of images to determine optimal
-        resolution scales. Images with more high-frequency content will maintain
-        higher resolutions for longer during training.
-
-        Args:
-            original_images: List of training images (torch.Tensor or numpy arrays)
-        """
         if self.resolution_mode != "freq":
-            print("[ INFO ] Skipped resolution scheduler initialization, the resolution mode is {}".format(
-                self.resolution_mode))
+            print("[ INFO ] Skipped resolution scheduler initialization, the resolution mode is {}".format(self.resolution_mode))
             return
 
         def compute_win_significance(significance_map: torch.Tensor, scale: float):
-            """Compute frequency significance within a centered window."""
             h, w = significance_map.shape[-2:]
             c = ((h + 1) // 2, (w + 1) // 2)
             win_size = (int(h / scale), int(w / scale))
-            win_significance = significance_map[
-                ...,
-                c[0] - win_size[0] // 2: c[0] + win_size[0] // 2,
-                c[1] - win_size[1] // 2: c[1] + win_size[1] // 2
-            ].sum().item()
+            win_significance = significance_map[..., c[0]-win_size[0]//2: c[0]+win_size[0]//2, c[1]-win_size[1]//2: c[1]+win_size[1]//2].sum().item()
             return win_significance
-
+        
         def scale_solver(significance_map: torch.Tensor, target_significance: float):
-            """Binary search to find scale that captures target frequency significance."""
             L, R, T = 0., 1., 64
             for _ in range(T):
                 mid = (L + R) / 2
@@ -207,34 +190,57 @@ class TrainingScheduler:
                 else:
                     R = mid
             return 1 / mid
-
+        
         print("[ INFO ] Initializing resolution scheduler...")
 
         self.max_reso_scale = 8
         self.next_i = 2
         scene_freq_image = None
-
+        
+        # Calculate high-frequency ratio for threshold decision
+        total_high_freq_energy = 0.0
+        total_energy = 0.0
+        
         for img in original_images:
-            # Convert to torch tensor if needed
-            if isinstance(img, np.ndarray):
-                img = torch.from_numpy(img)
-
-            # Ensure image is on GPU for faster FFT
-            if not img.is_cuda:
-                img = img.cuda()
-
-            # Ensure image is float
-            if img.dtype == torch.uint8:
-                img = img.float() / 255.0
-
-            # Compute FFT
             img_fft_centered = torch.fft.fftshift(torch.fft.fft2(img), dim=(-2, -1))
             img_fft_centered_mod = (img_fft_centered.real.square() + img_fft_centered.imag.square()).sqrt()
             scene_freq_image = img_fft_centered_mod if scene_freq_image is None else scene_freq_image + img_fft_centered_mod
 
+            # Calculate high-frequency ratio for this image
+            h, w = img_fft_centered_mod.shape[-2:]
+            center_h, center_w = h // 2, w // 2
+            
+            # High frequencies: outer 50%
+            high_freq_radius_h = int(h * 0.25)
+            high_freq_radius_w = int(w * 0.25)
+            
+            high_freq_mask = torch.ones_like(img_fft_centered_mod)
+            high_freq_mask[center_h - high_freq_radius_h:center_h + high_freq_radius_h,
+                        center_w - high_freq_radius_w:center_w + high_freq_radius_w] = 0
+            
+            high_freq_energy = (img_fft_centered_mod * high_freq_mask).sum().item()
+            img_total_energy = img_fft_centered_mod.sum().item()
+            
+            total_high_freq_energy += high_freq_energy
+            total_energy += img_total_energy
+
             e_total = img_fft_centered_mod.sum().item()
             e_min = e_total / self.start_significance_factor
             self.max_reso_scale = min(self.max_reso_scale, scale_solver(img_fft_centered_mod, e_min))
+
+        # Calculate overall high-frequency ratio
+        high_freq_ratio = total_high_freq_energy / total_energy if total_energy > 0 else 0
+        print(f"[ INFO ] Scene high-frequency ratio: {high_freq_ratio:.4f}")
+
+        # DYNAMIC SCALE SELECTION BASED ON 0.12 THRESHOLD
+        if high_freq_ratio > 0.12:
+            # High-frequency scene: start at 1/5 scale for more aggressive compression
+            starting_scale = 5.0
+            print(f"[ INFO ] High-frequency scene detected (>0.12), starting at 1/5 scale")
+        else:
+            # Low-frequency scene: start at 1/4 scale for faster training
+            starting_scale = 4.0
+            print(f"[ INFO ] Low-frequency scene detected (≤0.12), starting at 1/4 scale")
 
         modulation_func = math.log
 
@@ -244,33 +250,53 @@ class TrainingScheduler:
         scene_freq_image /= len(original_images)
         E_total = scene_freq_image.sum().item()
         E_min = compute_win_significance(scene_freq_image, self.max_reso_scale)
-
-        # First level (lowest resolution)
+        
+        # Override the first scale with our dynamic choice
         self.reso_level_significance.append(E_min)
-        self.reso_scales.append(self.max_reso_scale)
+        self.reso_scales.append(starting_scale)  # Use dynamic starting scale
         self.reso_level_begin.append(0)
-
-        # Intermediate levels
+        
+        # Generate intermediate scales
         for i in range(1, self.reso_sample_num - 1):
-            self.reso_level_significance.append(
-                (E_total - E_min) * (i - 0) / (self.reso_sample_num - 1 - 0) + E_min
-            )
+            self.reso_level_significance.append((E_total - E_min) * (i - 0) / (self.reso_sample_num-1 - 0) + E_min)
             self.reso_scales.append(scale_solver(scene_freq_image, self.reso_level_significance[-1]))
             self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
-            self.reso_level_begin.append(
-                int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min))
-            )
-
-        # Final level (full resolution)
+            self.reso_level_begin.append(int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min)))
+        
+        # Final full resolution
         self.reso_level_significance.append(modulation_func(E_total / E_min))
         self.reso_scales.append(1.)
         self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
-        self.reso_level_begin.append(
-            int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min))
-        )
+        self.reso_level_begin.append(int(self.increase_reso_until * self.reso_level_significance[-2] / modulation_func(E_total / E_min)))
         self.reso_level_begin.append(self.increase_reso_until)
 
+        # ADAPTIVE PROGRESSION BASED ON FREQUENCY CONTENT
+        # High-frequency scenes progress slower through scales
+        if high_freq_ratio > 0.12:
+            # For high-frequency scenes, spend more time at each scale
+            # Adjust the progression to be more gradual
+            scale_adjustment_factor = 0.7  # Slower progression
+        else:
+            # For low-frequency scenes, progress faster
+            scale_adjustment_factor = 1.3  # Faster progression
+        
+        # Apply non-linear adjustment to the progression
+        adjusted_begin = []
+        for i, begin_iter in enumerate(self.reso_level_begin):
+            if i == 0:
+                adjusted_begin.append(0)
+            elif i == len(self.reso_level_begin) - 1:
+                adjusted_begin.append(self.increase_reso_until)
+            else:
+                # Apply power law adjustment
+                progress = begin_iter / self.increase_reso_until
+                adjusted_progress = progress ** scale_adjustment_factor
+                adjusted_begin.append(int(adjusted_progress * self.increase_reso_until))
+        
+        self.reso_level_begin = adjusted_begin
+
         print(f"[ INFO ] Resolution scheduler initialized with {len(self.reso_scales)} levels")
+        print(f"[ INFO ] Starting scale: 1/{starting_scale:.1f}")
         print(f"[ INFO ] Max resolution scale: {self.max_reso_scale:.2f}")
         print(f"[ INFO ] Resolution will increase until iteration: {self.increase_reso_until}")
 
@@ -286,6 +312,63 @@ class TrainingScheduler:
         """
         scale = self.get_res_scale(iteration)
         return 1.0 / scale
+    
+    def adapt_resolution_progression(self, current_iteration: int, training_metrics: dict = None):
+        """
+        Dynamically adjust resolution progression based on training progress.
+        
+        This method can be called during training to adapt the resolution schedule
+        based on how well the training is progressing.
+        
+        Args:
+            current_iteration: Current training iteration
+            training_metrics: Dictionary containing training metrics like:
+                - 'psnr': Current PSNR value
+                - 'loss': Current loss value
+                - 'convergence_rate': Rate of improvement
+        """
+        if self.resolution_mode != "freq" or not self.reso_level_begin:
+            return
+        
+        # Only adapt after we've progressed through at least 2 scales
+        if current_iteration < self.reso_level_begin[2]:
+            return
+        
+        # Calculate current progress
+        progress_ratio = current_iteration / self.increase_reso_until
+        
+        # If we have training metrics, use them to guide adaptation
+        if training_metrics:
+            psnr = training_metrics.get('psnr', 0)
+            loss = training_metrics.get('loss', float('inf'))
+            
+            # If training is going well (high PSNR or low loss), consider accelerating
+            if psnr > 25 or loss < 0.1:
+                # Training is going well - consider faster progression
+                acceleration_factor = 1.1
+                self._accelerate_progression(acceleration_factor, current_iteration)
+            elif psnr < 20 and loss > 0.5:
+                # Training is struggling - consider slowing down
+                deceleration_factor = 0.9
+                self._decelerate_progression(deceleration_factor, current_iteration)
+
+    def _accelerate_progression(self, factor: float, current_iteration: int):
+        """Accelerate resolution progression by the given factor."""
+        # Only adjust future scale transitions
+        for i in range(len(self.reso_level_begin)):
+            if self.reso_level_begin[i] > current_iteration:
+                remaining_iterations = self.reso_level_begin[i] - current_iteration
+                accelerated_remaining = int(remaining_iterations * factor)
+                self.reso_level_begin[i] = current_iteration + accelerated_remaining
+
+    def _decelerate_progression(self, factor: float, current_iteration: int):
+        """Decelerate resolution progression by the given factor."""
+        # Only adjust future scale transitions
+        for i in range(len(self.reso_level_begin)):
+            if self.reso_level_begin[i] > current_iteration:
+                remaining_iterations = self.reso_level_begin[i] - current_iteration
+                decelerated_remaining = int(remaining_iterations * factor)
+                self.reso_level_begin[i] = current_iteration + decelerated_remaining
 
 class Scheduler(_LRScheduler):
     """
