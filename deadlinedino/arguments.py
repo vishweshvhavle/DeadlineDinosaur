@@ -96,7 +96,6 @@ class OptimizationParams(ParamGroup):
     reg_weight = 0.0
     learnable_viewproj = False
     densify_until_iter = -1  # Auto-set to iterations // 2 if -1
-    densification_interval = 100
     def __init__(self, parser):
         super().__init__(parser, "Optimization Parameters")
 
