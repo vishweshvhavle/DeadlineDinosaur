@@ -233,18 +233,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             }
             break
 
-        # Initialize resolution scheduler
-        resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
-        print(f"Resolution scheduler initialized: {resolution_scheduler.num_stages} stages, {resolution_scheduler.stage_duration}s per stage")
-
         last_debug_save_time = time.time()
+
+    # Initialize resolution scheduler (always needed, not just for debug mode)
+    resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
+    if pp.debug:
+        print(f"Resolution scheduler initialized: {resolution_scheduler.num_stages} stages, {resolution_scheduler.stage_duration}s per stage")
 
     # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
 
-    # Start resolution scheduler if in debug mode
-    if pp.debug and resolution_scheduler is not None:
-        resolution_scheduler.start()
+    # Start resolution scheduler
+    resolution_scheduler.start()
 
     for epoch in range(start_epoch,total_epoch):
         # Check if training time has exceeded 59.5 seconds BEFORE starting the epoch
