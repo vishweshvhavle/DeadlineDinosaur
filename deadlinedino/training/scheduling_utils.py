@@ -18,7 +18,7 @@ class TrainingScheduler:
     the frequency content of training images to determine optimal resolution schedules.
     """
 
-    def __init__(self, opt, pipe, gaussians, original_images: list) -> None:
+    def __init__(self, opt, pipe, gaussians, original_images: list, densify_params=None) -> None:
         """
         Initialize the training scheduler.
 
@@ -27,6 +27,7 @@ class TrainingScheduler:
             pipe: PipelineParams containing pipeline configuration
             gaussians: GaussianModel instance
             original_images: List of training images for FFT analysis
+            densify_params: Optional DensifyParams for densification interval (defaults to opt if not provided)
         """
         self.max_steps = opt.iterations
         self.init_n_gaussian = gaussians.get_xyz.shape[0]
@@ -35,7 +36,11 @@ class TrainingScheduler:
         self.densify_mode = getattr(pipe, 'densify_mode', 'freq')
         densify_until_iter = getattr(opt, 'densify_until_iter', -1)
         self.densify_until_iter = opt.iterations // 2 if densify_until_iter == -1 else densify_until_iter
-        self.densification_interval = getattr(opt, 'densification_interval', 100)
+        # Try densify_params first, fall back to opt, then to default
+        if densify_params is not None:
+            self.densification_interval = getattr(densify_params, 'densification_interval', 100)
+        else:
+            self.densification_interval = getattr(opt, 'densification_interval', 100)
 
         # Resolution parameters
         self.resolution_mode = getattr(pipe, 'resolution_mode', 'freq')
