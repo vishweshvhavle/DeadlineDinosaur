@@ -16,7 +16,7 @@ cd DeadlineDinosaur
 > Note that this can take quite a while.
 ```
 conda env create --file environment.yml
-conda activate DeadlineDinosaur 
+conda activate DDinoGS
 ```
 
 ### Install all submodules
