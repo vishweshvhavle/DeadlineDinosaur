@@ -7,6 +7,7 @@ import numpy as np
 import math
 import os
 import time
+import json
 import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
@@ -243,21 +244,35 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
     # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
-
-    # # Start resolution scheduler
-    # resolution_scheduler.start()
-
+    resolution_scheduler.start_timing()
+    elapsed_time = 0.0
     for epoch in range(start_epoch,total_epoch):
-        # Check if training time has exceeded 59.5 seconds BEFORE starting the epoch
-        # This ensures we don't overshoot by running another full epoch
-        elapsed_time = time.time() - training_start_time
-        if elapsed_time >= 59.5:
-            progress_bar.close()
-            print(f"Training stopped at {elapsed_time:.2f}s (target: 59.5s) at epoch {epoch}")
 
+        old_elapsed_time = elapsed_time
+        elapsed_time = time.time() - training_start_time
+        epoch_time = elapsed_time - old_elapsed_time
+        if elapsed_time >= 59.5 - epoch_time:
+
+            progress_bar.close()
             # Save the most recent .ply file
             save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
+            os.makedirs(save_path, exist_ok=True)
 
+            # Save training time as JSON
+            metrics = {
+                "time": elapsed_time,
+                "model_path": lp.model_path,
+                "status": "timeout",
+                "final_epoch": epoch,
+                "total_epochs": total_epoch,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            metrics_file_path = os.path.join(save_path, "training_metrics.json")
+            with open(metrics_file_path, 'w') as f:
+                json.dump(metrics, f, indent=4)
+            
+            # Save .ply file
             if pp.cluster_size:
                 tensors = scene.cluster.uncluster(xyz, scale, rot, sh_0, sh_rest, opacity)
             else:
@@ -270,6 +285,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 torch.save(list(view_params.parameters())+[camera_focal_params], os.path.join(save_path, "viewproj.pth"))
 
             print(f"Saved checkpoint to {save_path}")
+            print(f"Training metrics saved to {metrics_file_path}")
             break
 
         with torch.no_grad():
@@ -409,12 +425,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.zero_grad()
                 schedular.step()
                  # Update scheduler with current iteration
-                resolution_scheduler.step(epoch)
+                resolution_scheduler.step()
 
                 # Debug visualization: save every 5 seconds
                 if pp.debug and debug_view_data is not None and resolution_scheduler is not None:
                     current_time = time.time()
-                    if current_time - last_debug_save_time >= 5.0:
+                    if current_time - last_debug_save_time >= 3.0:
                         with torch.no_grad():
                             # Get cluster information for rendering
                             _cluster_origin = None
@@ -590,11 +606,29 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         if epoch in save_ply or epoch==total_epoch-1:
             if epoch==total_epoch-1:
                 progress_bar.close()
-                print("{} takes: {} s".format(lp.model_path,progress_bar.format_dict['elapsed']))
+                elapsed_time = progress_bar.format_dict['elapsed']
+                print("{} takes: {} s".format(lp.model_path, elapsed_time))
                 save_path=os.path.join(lp.model_path,"point_cloud","finish")
             else:
-                save_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch))    
+                elapsed_time = time.time() - training_start_time
+                save_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch))
 
+            # Create directory
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save training time as JSON
+            metrics = {
+                "time": elapsed_time,
+                "model_path": lp.model_path,
+                "status": "completed" if epoch == total_epoch-1 else "checkpoint",
+                "epoch": epoch,
+                "total_epochs": total_epoch,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(os.path.join(save_path, "training_metrics.json"), 'w') as f:
+                json.dump(metrics, f, indent=4)
+            
+            # Save .ply file
             if pp.cluster_size:
                 tensors=scene.cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
             else:
@@ -605,7 +639,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             io_manager.save_ply(os.path.join(save_path,"point_cloud.ply"),*param_nyp)
             if op.learnable_viewproj:
                 torch.save(list(view_params.parameters())+[camera_focal_params],os.path.join(save_path,"viewproj.pth"))
-            pass
+            
+            print(f"Training metrics saved to {os.path.join(save_path, 'training_metrics.json')}")
 
         if epoch in save_checkpoint:
             io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)
