@@ -595,6 +595,10 @@ class EighAndInverse2x2Matrix(BaseWrapper):
 
 
 class Binning(BaseWrapper):
+    # Class variables to track resolution changes
+    _last_grid = None
+    _last_tile_size = None
+
     @torch.no_grad()
     def __binning_script(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,
             img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]):
@@ -618,7 +622,7 @@ class Binning(BaseWrapper):
             right_down[:,1].clamp_(0,img_tile_shape[0])
 
             return left_up,right_down
-        
+
         nvtx.range_push("binning_allocate")
         img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size))),int(math.ceil(img_pixel_shape[1]/float(tile_size))))
         tiles_num=img_tile_shape[0]*img_tile_shape[1]
@@ -640,7 +644,7 @@ class Binning(BaseWrapper):
         total_tiles_num_batch=prefix_sum[:,-1]
         allocate_size=total_tiles_num_batch.max().cpu()
         nvtx.range_pop()
-        
+
         # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
         large_points_index=(tiles_touched>=32).nonzero()
         my_table=litegs_fused.createTable(left_up,right_down,prefix_sum,point_ids,large_points_index,int(allocate_size),img_tile_shape[1])
@@ -653,13 +657,13 @@ class Binning(BaseWrapper):
 
         # range
         tile_start_index=litegs_fused.tileRange(sorted_tileId,int(allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
-            
+
         return tile_start_index,sorted_pointId,b_visible
-    
+
     @torch.no_grad()
     def __binning_fused(ndc:torch.Tensor,view_depth:torch.Tensor,inv_cov2d:torch.Tensor,opacity:torch.Tensor,
             img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]):
-        
+
         img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size[0]))),int(math.ceil(img_pixel_shape[1]/float(tile_size[1]))))
         tiles_num=img_tile_shape[0]*img_tile_shape[1]
 
@@ -680,7 +684,7 @@ class Binning(BaseWrapper):
         prefix_sum=depth_sorted_allocate_size.cumsum(1,dtype=torch.int32)#start index of points
         total_tiles_num_batch=prefix_sum[:,-1]
         total_allocate_size=total_tiles_num_batch.max().cpu()
-        
+
         # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
         my_table=litegs_fused.create_table(ndc,inv_cov2d,opacity,prefix_sum,depth_sorted_index,
                                                 int(total_allocate_size),img_pixel_shape[0],img_pixel_shape[1],tile_size[0],tile_size[1])
@@ -693,10 +697,50 @@ class Binning(BaseWrapper):
 
         # range
         tile_start_index=litegs_fused.tileRange(sorted_tileId,int(total_allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
-            
+
         return tile_start_index,sorted_pointId,b_visible.sum(0)
-    
-    
+
+    @classmethod
+    def call_fused(cls, *args, **kwargs):
+        """
+        Override call_fused to track resolution changes and handle CUDA configuration.
+
+        This helps avoid "invalid configuration argument" errors when resolution changes
+        during dynamic resolution scaling.
+        """
+        # Extract img_pixel_shape and tile_size from args
+        # Signature: (ndc, view_depth, inv_cov2d, opacity, img_pixel_shape, tile_size)
+        if len(args) >= 6:
+            img_pixel_shape = args[4]
+            tile_size = args[5]
+
+            # Track resolution changes
+            current_grid = (img_pixel_shape[0], img_pixel_shape[1], tile_size[0], tile_size[1])
+
+            if cls._last_grid is None or cls._last_grid != current_grid:
+                # Resolution changed - force CUDA synchronization to ensure clean state
+                torch.cuda.synchronize()
+                cls._last_grid = current_grid
+                cls._last_tile_size = tile_size
+
+        try:
+            return cls._fused(*args, **kwargs)
+        except RuntimeError as e:
+            if "CUDA error: invalid configuration argument" in str(e):
+                # Provide helpful debug information
+                if len(args) >= 6:
+                    img_h, img_w = args[4]
+                    tile_h, tile_w = args[5]
+                    tiles_h = int(math.ceil(img_h / float(tile_h)))
+                    tiles_w = int(math.ceil(img_w / float(tile_w)))
+                    print(f"[ ERROR ] CUDA configuration error during binning:")
+                    print(f"          Resolution: {img_w}x{img_h}, Tile size: {tile_w}x{tile_h}")
+                    print(f"          Tile grid: {tiles_w}x{tiles_h} ({tiles_w*tiles_h} total tiles)")
+                    print(f"          This may indicate the resolution is too small or creates invalid tile configuration")
+                raise
+            else:
+                raise
+
     _fused=__binning_fused
     _script=__binning_script
 ###

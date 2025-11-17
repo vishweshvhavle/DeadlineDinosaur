@@ -122,30 +122,46 @@ class ResolutionScheduler:
         """
         Get tile-aligned dimensions that maintain aspect ratio.
         Strategy: Scale both dimensions by the same factor, then round to tile multiples.
+        Ensures minimum safe resolution to avoid CUDA configuration errors.
         """
         scale = self.get_resolution_scale()
-        
+
         if scale >= 0.99:  # Close to full scale
             return full_height, full_width
-        
+
         # Calculate target dimensions
         target_height = full_height * scale
         target_width = full_width * scale
-        
+
         # Round to nearest tile multiple (maintains aspect ratio better than ceiling)
         downsampled_height = round(target_height / self.tile_height) * self.tile_height
         downsampled_width = round(target_width / self.tile_width) * self.tile_width
-        
-        # Ensure minimum dimensions (at least 2 tiles in each dimension)
-        min_height = self.tile_height * 2
-        min_width = self.tile_width * 2
+
+        # CRITICAL: Ensure minimum dimensions to avoid CUDA "invalid configuration argument" errors
+        # At least 4 tiles in each dimension for stable CUDA kernel configuration
+        # This prevents issues with very small downsampled resolutions
+        min_tiles_per_dim = 4
+        min_height = self.tile_height * min_tiles_per_dim
+        min_width = self.tile_width * min_tiles_per_dim
+
+        # Apply minimum constraints
         downsampled_height = max(min_height, downsampled_height)
         downsampled_width = max(min_width, downsampled_width)
-        
+
         # Clamp to original dimensions
         downsampled_height = min(downsampled_height, full_height)
         downsampled_width = min(downsampled_width, full_width)
-        
+
+        # Final validation: ensure dimensions are valid tile multiples
+        downsampled_height = (downsampled_height // self.tile_height) * self.tile_height
+        downsampled_width = (downsampled_width // self.tile_width) * self.tile_width
+
+        # Safety check: if dimensions are still too small, use at least the minimum
+        if downsampled_height < min_height:
+            downsampled_height = min(min_height, full_height)
+        if downsampled_width < min_width:
+            downsampled_width = min(min_width, full_width)
+
         return downsampled_height, downsampled_width
 
     def get_downsampled_proj_matrix(self, proj_matrix: np.ndarray,
