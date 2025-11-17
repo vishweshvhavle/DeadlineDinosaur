@@ -67,25 +67,15 @@ class ResolutionScheduler:
         self.start_time = None
         self.current_time = 0.0
         
-        # Smooth scaling schedule: 0-40s from 1/5 to 1.0, then 40-60s at 1.0
-        self.scaling_duration = 20.0  # 40 seconds to go from 1/5 to full scale
-        self.full_scale_duration = 40.0  # 20 seconds at full scale
+        # Smooth scaling schedule: 
+        self.scaling_duration = 6.0  # 6 seconds to go from 1/5 to full scale
+        self.full_scale_duration = 54.0  # 54 seconds at full scale
         self.total_duration = 60.0
-        
-        # Initialize scheduler
-        self._init_scheduler()
-
-    def _init_scheduler(self):
-        """Initialize the time-based resolution scheduler."""
-        print("[ INFO ] Initializing time-based resolution scheduler...")
-        print(f"[ INFO ] Schedule: Smooth scaling from 1/5 to 1.0 over {self.scaling_duration}s, "
-              f"then full scale for {self.full_scale_duration}s")
 
     def start_timing(self):
         """Start the timing for the scheduler."""
         self.start_time = time.time()
         self.current_time = 0.0
-        print(f"[ INFO ] Resolution scheduler timing started at: {self.start_time}")
 
     def step(self):
         """Update the current time."""
@@ -97,7 +87,7 @@ class ResolutionScheduler:
     def get_resolution_scale(self) -> float:
         """
         Get the current resolution scale factor based on elapsed time.
-        Uses smooth interpolation from 1/5 to 1.0 over 40 seconds.
+        Uses smooth interpolation from 1/5 to 1.0.
         """
         if self.resolution_mode == "const":
             return 1.0

@@ -4,7 +4,10 @@ from torch.utils.data import DataLoader
 from torchmetrics.image import psnr,ssim,lpip
 import sys
 import os
+import json
 import matplotlib.pyplot as plt
+import torchvision
+from tqdm import tqdm
 
 import deadlinedino
 import deadlinedino.config
@@ -40,29 +43,53 @@ if __name__ == "__main__":
         cameras_info,camera_frames,init_xyz,init_color=deadlinedino.io_manager.load_slam_result(lp.source_path)#lp.sh_degree,lp.resolution
 
     if OUTPUT_FILE:
+        renders_dir = os.path.join(lp.model_path, "renders")
         try:
-            shutil.rmtree(os.path.join(lp.model_path,"Trainingset"))
-            shutil.rmtree(os.path.join(lp.model_path,"Testset"))
+            shutil.rmtree(renders_dir)
         except:
             pass
-        os.makedirs(os.path.join(lp.model_path,"Trainingset"),exist_ok=True)
-        os.makedirs(os.path.join(lp.model_path,"Testset"),exist_ok=True)
+        os.makedirs(renders_dir, exist_ok=True)
 
     #preload
     for camera_frame in camera_frames:
         camera_frame.load_image(lp.resolution)
 
     #Dataset
-    if lp.eval:
-        training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
-        test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
-        trainingset=deadlinedino.data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
-        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
-        testset=deadlinedino.data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
-        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+    # Load train/test split from train_test_split.json
+    split_json_path = os.path.join(lp.source_path, "train_test_split.json")
+    if os.path.exists(split_json_path):
+        with open(split_json_path, 'r') as f:
+            split_data = json.load(f)
+        train_image_names = set(split_data.get("train", []))
+        test_image_names = set(split_data.get("test", []))
+
+        # Filter frames based on the split
+        if lp.eval:
+            training_frames = [c for c in camera_frames if c.name in train_image_names]
+            test_frames = [c for c in camera_frames if c.name in test_image_names]
+            trainingset=deadlinedino.data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
+            train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+            testset=deadlinedino.data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
+            test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+            print(f"Loaded train/test split: {len(training_frames)} training images, {len(test_frames)} test images")
+        else:
+            # For evaluation only, use test images
+            test_frames = [c for c in camera_frames if c.name in test_image_names]
+            trainingset=deadlinedino.data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
+            train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+            print(f"Loaded test split: {len(test_frames)} test images")
     else:
-        trainingset=deadlinedino.data.CameraFrameDataset(cameras_info,camera_frames,lp.resolution,pp.device_preload)
-        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+        # Fallback to original logic if train_test_split.json doesn't exist
+        if lp.eval:
+            training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
+            test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
+            trainingset=deadlinedino.data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
+            train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+            testset=deadlinedino.data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
+            test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+        else:
+            trainingset=deadlinedino.data.CameraFrameDataset(cameras_info,camera_frames,lp.resolution,pp.device_preload)
+            train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
     norm_trans,norm_radius=trainingset.get_norm()
 
     #model
@@ -80,7 +107,13 @@ if __name__ == "__main__":
 
     # Fall back to finish directory if no timeout checkpoint found
     if ply_path is None or not os.path.exists(ply_path):
-        ply_path = os.path.join(point_cloud_dir, "finish", "point_cloud.ply")
+        finish_path = os.path.join(point_cloud_dir, "finish", "point_cloud.ply")
+        if os.path.exists(finish_path):
+            ply_path = finish_path
+        else:
+            print(f"Error: Could not find point cloud file in {point_cloud_dir}")
+            print(f"Checked for timeout_epoch_* directories and finish/point_cloud.ply")
+            sys.exit(1)
 
     xyz,scale,rot,sh_0,sh_rest,opacity=deadlinedino.io_manager.load_ply(ply_path,lp.sh_degree)
     xyz=torch.Tensor(xyz).cuda()
@@ -104,55 +137,60 @@ if __name__ == "__main__":
         tvec=view_params[:,4:]
 
     #metrics
-    # ssim_metrics=ssim.StructuralSimilarityIndexMeasure(data_range=1.0).cuda()
     psnr_metrics=psnr.PeakSignalNoiseRatio(data_range=1.0).cuda()
-    # lpip_metrics=lpip.LearnedPerceptualImagePatchSimilarity(net_type='vgg').cuda()
 
     #iter
-    if lp.eval:
-        loaders={"Trainingset":train_loader,"Testset":test_loader}
-    else:
-        loaders={"Trainingset":train_loader}
-
     with torch.no_grad():
-        for loader_name,loader in loaders.items():
-            # ssim_list=[]
-            psnr_list=[]
-            # lpips_list=[]
-            for index,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(loader):
-                view_matrix=view_matrix.cuda()
-                proj_matrix=proj_matrix.cuda()
-                frustumplane=frustumplane.cuda()
-                gt_image=gt_image.cuda()/255.0
-                if loader_name=="Trainingset" and op.learnable_viewproj:
-                    #fix view matrix
-                    view_matrix[:,:3, :3] = rot_matrix[idx:idx+1]
-                    view_matrix[:,3, :3] = tvec[idx:idx+1]
+        psnr_list=[]
 
-                    #fix proj matrix
-                    focal_x=proj_parmas
-                    focal_y=proj_parmas*gt_image.shape[3]/gt_image.shape[2]
-                    proj_matrix[:,0,0]=focal_x
-                    proj_matrix[:,1,1]=focal_y
+        # Create progress bar
+        pbar = tqdm(train_loader, desc=f"Processing images", unit="img")
+
+        for index,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(pbar):
+            view_matrix=view_matrix.cuda()
+            proj_matrix=proj_matrix.cuda()
+            frustumplane=frustumplane.cuda()
+            gt_image=gt_image.cuda()/255.0
+            if op.learnable_viewproj:
+                #fix view matrix
+                view_matrix[:,:3, :3] = rot_matrix[idx:idx+1]
+                view_matrix[:,3, :3] = tvec[idx:idx+1]
+
+                #fix proj matrix
+                focal_x=proj_parmas
+                focal_y=proj_parmas*gt_image.shape[3]/gt_image.shape[2]
+                proj_matrix[:,0,0]=focal_x
+                proj_matrix[:,1,1]=focal_y
 
 
-                _,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=deadlinedino.render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
-                                                                                                        xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
-                img,transmitance,depth,normal,_=deadlinedino.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
-                                                            lp.sh_degree,gt_image.shape[2:],pp)
-                psnr_value=psnr_metrics(img,gt_image)
-                # ssim_list.append(ssim_metrics(img,gt_image).unsqueeze(0))
-                psnr_list.append(psnr_value.unsqueeze(0))
-                # lpips_list.append(lpip_metrics(img,gt_image).unsqueeze(0))
-                if OUTPUT_FILE:
-                    plt.imsave(os.path.join(lp.model_path,loader_name,"{}-{:.2f}-rd.png".format(index,float(psnr_value))),img.detach().cpu()[0].permute(1,2,0).numpy())
-                    plt.imsave(os.path.join(lp.model_path,loader_name,"{}-{:.2f}-gt.png".format(index,float(psnr_value))),gt_image.detach().cpu()[0].permute(1,2,0).numpy())
-            # ssim_mean=torch.concat(ssim_list,dim=0).mean()
-            psnr_mean=torch.concat(psnr_list,dim=0).mean()
-            # lpips_mean=torch.concat(lpips_list,dim=0).mean()
+            _,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=deadlinedino.render.render_preprocess(cluster_origin,cluster_extend,frustumplane,
+                                                                                                    xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
+            img,transmitance,depth,normal,_=deadlinedino.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
+                                                        lp.sh_degree,gt_image.shape[2:],pp)
+            psnr_value=psnr_metrics(img,gt_image)
+            psnr_list.append(psnr_value.unsqueeze(0))
 
-            print("  Scene:{0}".format(lp.model_path+" "+loader_name))
-            # print("  SSIM : {:>12.7f}".format(float(ssim_mean)))
-            print("  PSNR : {:>12.7f}".format(float(psnr_mean)))
-            # print("  LPIPS: {:>12.7f}".format(float(lpips_mean)))
-            print("")
+            # Update progress bar with current PSNR
+            pbar.set_postfix({
+                'PSNR': f'{psnr_value.item():.2f}',
+            })
+
+            if OUTPUT_FILE:
+
+                torchvision.utils.save_image(
+                    img[0],  # Remove batch dimension
+                    os.path.join(lp.model_path, "renders", f"{index}-{float(psnr_value):.2f}-render.png")
+                )
+
+                torchvision.utils.save_image(
+                    gt_image[0],  # Remove batch dimension
+                    os.path.join(lp.model_path, "renders", f"{index}-{float(psnr_value):.2f}-gt.png")
+                )
+
+        pbar.close()
+
+        psnr_mean=torch.concat(psnr_list,dim=0).mean()
+
+        print("  Scene:{0}".format(lp.model_path))
+        print("  PSNR : {:>12.7f}".format(float(psnr_mean)))
+        print("")
