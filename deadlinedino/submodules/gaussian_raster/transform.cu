@@ -69,7 +69,7 @@ at::Tensor jacobianRayspace(
     at::Tensor jacobian_matrix = torch::zeros({N,3,3,P}, translated_position.options());
 
     int threadsnum = 256;
-    dim3 Block3d(std::ceil(P/(float)threadsnum), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P/(float)threadsnum)), N, 1);
     if (bTranspose)
     {
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(translated_position.TYPE(), __FUNCTION__, [&] {jacobian_rayspace_kernel<scalar_t,true > << <Block3d, threadsnum >> > (
@@ -416,7 +416,7 @@ std::vector<at::Tensor> world2ndc_forward(at::Tensor world_position,at::Tensor v
     at::Tensor repc_hom_w = torch::empty({ N,1,P }, world_position.options());
 
     int threadsnum = 256;
-    dim3 Block3d(std::ceil(P / 256.0f), N, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(P / 256.0f)), N, 1);
 
     world2ndc_forward_kernel << <Block3d, threadsnum >> > (
         view_project_matrix.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),

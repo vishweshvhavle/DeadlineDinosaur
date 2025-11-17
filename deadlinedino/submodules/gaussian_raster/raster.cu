@@ -411,7 +411,7 @@ std::vector<at::Tensor> rasterize_forward(
     //pack params
     int points_num = ndc.size(2);
     at::Tensor packed_params = torch::empty({ viewsnum,points_num,sizeof(PackedParams)/sizeof(float)}, ndc.options().requires_grad(false));
-    dim3 Block3d(std::ceil(points_num / 512.0f), viewsnum, 1);
+    dim3 Block3d(std::max(1, (int)std::ceil(points_num / 512.0f)), viewsnum, 1);
     {
         pack_forward_params<<<Block3d,512>>>(
             ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
@@ -443,7 +443,7 @@ std::vector<at::Tensor> rasterize_forward(
 
     {
         int tiles_per_block = 4;
-        dim3 Block3d(std::ceil(render_tile_num / float(tiles_per_block)), viewsnum, 1);
+        dim3 Block3d(std::max(1, (int)std::ceil(render_tile_num / float(tiles_per_block))), viewsnum, 1);
         dim3 Thread3d(32, tiles_per_block);
         switch (ENCODE(enable_statistic, enable_trans, enable_depth))
         {
@@ -535,7 +535,7 @@ std::vector<at::Tensor> rasterize_forward_packed(
 
     {
         int tiles_per_block = 4;
-        dim3 Block3d(std::ceil(render_tile_num / float(tiles_per_block)), viewsnum, 1);
+        dim3 Block3d(std::max(1, (int)std::ceil(render_tile_num / float(tiles_per_block))), viewsnum, 1);
         dim3 Thread3d(32, tiles_per_block);
         switch (ENCODE(enable_statistic, enable_trans, enable_depth))
         {
@@ -996,7 +996,7 @@ std::vector<at::Tensor> rasterize_backward(
 
     CUDA_CHECK_ERRORS;
 
-    dim3 UnpackBlock3d(std::ceil(points_num / 512.0f), batch_num, 1);
+    dim3 UnpackBlock3d(std::max(1, (int)std::ceil(points_num / 512.0f)), batch_num, 1);
     unpack_gradient<<<UnpackBlock3d,512>>>(
         packed_grad.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         (float*)grad_inv_sacler.data_ptr(),
