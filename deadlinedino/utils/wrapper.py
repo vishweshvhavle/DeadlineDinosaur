@@ -709,89 +709,19 @@ class CompactVisibleWithSparseGrad(torch.autograd.Function):
         compacted_tensors=[]
         for tensor in args:
             compacted_tensors.append(tensor[...,visible_id,:].contiguous())
-        ctx.visible_id=visible_id
         ctx.chunk_num=args[0].shape[-2]
         ctx.chunk_size=args[0].shape[-1]
         return *compacted_tensors,
-
+    
     @staticmethod
     def backward(ctx,*args):
-        visible_id=ctx.visible_id
         chunk_num=ctx.chunk_num
         chunk_size=ctx.chunk_size
         grads=[]#the index of sprase tensor is invalid!! backward compact with Our Optimizer
         for grad in args:
-            if grad is None:
-                grads.append(None)
-                continue
-            # Create sparse gradient by placing compact grad values at visible_id positions
-            num_visible = visible_id.shape[0]
-            original_shape = grad.shape
-
-            # The forward pass does: tensor[...,visible_id,:]
-            # So the grad comes back with shape (..., num_visible, chunk_size)
-            # We need to create a grad with shape (..., chunk_num, chunk_size)
-            # where only the visible_id positions are filled
-
-            # For sparse tensors, we need to create indices for ALL non-zero elements
-            # The challenge is that PyTorch sparse tensors require sparse dims to be first
-            # So we need to flatten all leading dims, create sparse tensor, then restore shape
-
-            leading_dims = original_shape[:-2]
-
-            # Calculate total number of elements in leading dimensions
-            n_leading = torch.prod(torch.tensor(leading_dims)).item() if leading_dims else 1
-
-            # Reshape grad to (n_leading, num_visible, chunk_size)
-            grad_flat = grad.reshape(n_leading, num_visible, chunk_size)
-
-            # Values shape: (n_leading * num_visible, chunk_size)
-            values = grad_flat.reshape(-1, chunk_size)
-
-            # Now we need to create indices for the original shape
-            # The sparse tensor needs to have shape (*leading_dims, chunk_num, chunk_size)
-            # with sparse dimensions for all dims except the last (chunk_size is dense)
-
-            n_sparse_dims = len(leading_dims) + 1  # +1 for chunk_num dimension
-            nnz = n_leading * num_visible  # total number of non-zero entries
-
-            # Create indices tensor of shape (n_sparse_dims, nnz)
-            if leading_dims:
-                # Compute multi-dimensional indices from flattened index
-                # For shape (d0, d1, ..., dk, chunk_num, chunk_size), we need to:
-                # 1. Map each position in grad_flat to its original coordinates
-                indices_list = []
-
-                # For each leading dimension, compute the index
-                strides = []
-                stride = 1
-                for dim_size in reversed(leading_dims):
-                    strides.insert(0, stride)
-                    stride *= dim_size
-
-                leading_flat_idx = torch.arange(n_leading, device=grad.device, dtype=torch.long).unsqueeze(1).expand(n_leading, num_visible).reshape(-1)
-
-                for i, (dim_size, stride) in enumerate(zip(leading_dims, strides)):
-                    dim_indices = (leading_flat_idx // stride) % dim_size
-                    indices_list.append(dim_indices)
-
-                # Add chunk dimension indices
-                chunk_indices = visible_id.unsqueeze(0).expand(n_leading, num_visible).reshape(-1).long()
-                indices_list.append(chunk_indices)
-
-                indices = torch.stack(indices_list, dim=0)
-            else:
-                # No leading dimensions, just chunk indices
-                indices = visible_id.long().unsqueeze(0)
-
-            # Create sparse tensor with original shape
-            placeholder_grad = torch.sparse_coo_tensor(
-                indices,
-                values,
-                (*leading_dims, chunk_num, chunk_size),
-                device=grad.device
-            )
-
+            sparse_value=grad.reshape(-1,chunk_size)
+            placeholder_grad=torch.sparse_coo_tensor(torch.empty(grad.dim()-1,sparse_value.shape[0],device='cuda'),sparse_value,(*grad.shape[:-2],chunk_num,chunk_size))
+            # placeholder_grad=torch.concat((grad, torch.empty((*grad.shape[:-2], chunk_num-grad.shape[-2], chunk_size),device='cuda')), dim=-2)
             grads.append(placeholder_grad)
         return None,*grads
 

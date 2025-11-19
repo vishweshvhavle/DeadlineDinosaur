@@ -7,10 +7,9 @@ import numpy as np
 import math
 import os
 import time
-import json
 import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw, ImageFont
+import json
 
 from .. import arguments
 from .. import data
@@ -22,627 +21,539 @@ from .. import render
 from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
-from .scheduling_utils import ResolutionScheduler
+from . import schedule_utils 
 
-def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
-    return torch.abs((network_output - gt)).mean()
-
-
-def __save_debug_view(debug_dir, iteration, render_img, gt_img, view_id, image_resolution,
-                     downsampled_render_img=None, downsampled_gt_img=None, resolution_info=None):
-    """Save debug visualization with render and GT, plus optional downsampled versions"""
-    # Convert tensors to numpy arrays (CHW -> HWC, 0-1 range)
-    render_np = render_img.detach().cpu().permute(1, 2, 0).numpy()
-    gt_np = gt_img.detach().cpu().permute(1, 2, 0).numpy()
-
-    # Clip and convert to uint8
-    render_np = np.clip(render_np * 255, 0, 255).astype(np.uint8)
-    gt_np = np.clip(gt_np * 255, 0, 255).astype(np.uint8)
-
-    # Create PIL images
-    render_pil = Image.fromarray(render_np)
-    gt_pil = Image.fromarray(gt_np)
-
-    # Process downsampled images if provided
-    if downsampled_render_img is not None and downsampled_gt_img is not None:
-        downsampled_render_np = downsampled_render_img.detach().cpu().permute(1, 2, 0).numpy()
-        downsampled_gt_np = downsampled_gt_img.detach().cpu().permute(1, 2, 0).numpy()
-
-        downsampled_render_np = np.clip(downsampled_render_np * 255, 0, 255).astype(np.uint8)
-        downsampled_gt_np = np.clip(downsampled_gt_np * 255, 0, 255).astype(np.uint8)
-
-        # Keep downsampled images at their native resolution (don't upscale)
-        downsampled_render_pil = Image.fromarray(downsampled_render_np)
-        downsampled_gt_pil = Image.fromarray(downsampled_gt_np)
-
-        # Create 2x2 grid layout with proper sizing for different resolutions
-        full_h, full_w = render_np.shape[:2]
-        ds_h, ds_w = downsampled_render_np.shape[:2]
-        label_height = 30
-
-        # Calculate dimensions: use full resolution for width, stack vertically
-        combined_width = full_w * 2
-        combined_height = (full_h + label_height) + (ds_h + label_height)
-        combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
-
-        # Paste images in 2x2 grid (top row is full res, bottom row is downsampled at native res)
-        # Top row: Full resolution render and GT
-        combined.paste(render_pil, (0, label_height))
-        combined.paste(gt_pil, (full_w, label_height))
-        # Bottom row: Downsampled render and GT at their native resolution
-        combined.paste(downsampled_render_pil, (0, full_h + label_height * 2))
-        combined.paste(downsampled_gt_pil, (full_w, full_h + label_height * 2))
-
-        # Add labels
-        draw = ImageDraw.Draw(combined)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        except:
-            font = ImageFont.load_default()
-
-        # Top row labels
-        render_label = f"Render (Iter: {iteration})"
-        gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
-        draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
-        draw.text((full_w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
-
-        # Bottom row labels
-        if resolution_info:
-            stage = resolution_info.get('stage', 1)
-            scale = resolution_info.get('scale', 1.0)
-            elapsed = resolution_info.get('elapsed_time', 0.0)
-            ds_render_res = f"{downsampled_render_np.shape[1]}x{downsampled_render_np.shape[0]}"
-            ds_gt_res = f"{downsampled_gt_np.shape[1]}x{downsampled_gt_np.shape[0]}"
-            downsampled_render_label = f"Downsampled Render (Stage {stage}, {scale:.2%}, {ds_render_res})"
-            downsampled_gt_label = f"Downsampled GT ({ds_gt_res}, Time: {elapsed:.1f}s)"
-        else:
-            downsampled_render_label = "Downsampled Render"
-            downsampled_gt_label = "Downsampled GT"
-
-        draw.text((10, full_h + label_height + 5), downsampled_render_label, fill=(0, 0, 0), font=font)
-        draw.text((full_w + 10, full_h + label_height + 5), downsampled_gt_label, fill=(0, 0, 0), font=font)
-
-    else:
-        # Original 1x2 layout if no downsampled images
-        h, w = render_np.shape[:2]
-        label_height = 30
-
-        combined_width = w * 2
-        combined_height = h + label_height
-        combined = Image.new('RGB', (combined_width, combined_height), color=(255, 255, 255))
-
-        combined.paste(render_pil, (0, label_height))
-        combined.paste(gt_pil, (w, label_height))
-
-        draw = ImageDraw.Draw(combined)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        except:
-            font = ImageFont.load_default()
-
-        render_label = f"Render (Iter: {iteration})"
-        gt_label = f"GT (View: {view_id}, Res: {image_resolution})"
-
-        draw.text((10, 5), render_label, fill=(0, 0, 0), font=font)
-        draw.text((w + 10, 5), gt_label, fill=(0, 0, 0), font=font)
-
-    # Save image
-    save_path = os.path.join(debug_dir, f"debug_iter_{iteration:06d}.png")
-    combined.save(save_path)
-
-def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
-          test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
+def start(
+    lp: arguments.ModelParams,
+    op: arguments.OptimizationParams,
+    pp: arguments.PipelineParams,
+    dp: arguments.DensifyParams,
+    test_epochs: list = [],
+    save_ply: list = [],
+    save_checkpoint: list = [],
+    start_checkpoint: str = None
+):
+    """
+    Main training loop for 3D Gaussian Splatting with coarse-to-fine resolution scheduling.
     
-    cameras_info:dict[int,data.CameraInfo]=None
-    camera_frames:list[data.ImageFrame]=None
-    if lp.source_type=="colmap":
-        cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)#lp.sh_degree,lp.resolution
-    elif lp.source_type=="slam":
-        cameras_info,camera_frames,init_xyz,init_color=io_manager.load_slam_result(lp.source_path)#lp.sh_degree,lp.resolution
-
-    #preload
-    for camera_frame in camera_frames:
-        camera_frame.load_image(lp.resolution)
-
-    #Dataset
+    Args:
+        lp: Model parameters (source path, resolution, SH degree)
+        op: Optimization parameters (iterations, learning rates, regularization)
+        pp: Pipeline parameters (device settings, clustering, resolution mode)
+        dp: Densification parameters (pruning, splitting intervals)
+        test_epochs: List of epochs to run evaluation
+        save_ply: List of epochs to save point cloud
+        save_checkpoint: List of epochs to save full checkpoint
+        start_checkpoint: Path to checkpoint for resuming training
+    """
+    
+    # ========== 1. DATA LOADING ==========
+    cameras_info, camera_frames, init_xyz, init_color = _load_scene_data(lp)
+    
+    # Preload all images to memory
+    for frame in camera_frames:
+        frame.load_image(lp.resolution)
+    
+    # ========== 2. TRAIN/TEST SPLIT ==========
+    training_frames, test_frames = _create_train_test_split(
+        lp.source_path, camera_frames, lp.eval
+    )
+    
+    # Create data loaders
+    trainingset = CameraFrameDataset(
+        cameras_info, training_frames, lp.resolution, pp.device_preload
+    )
+    train_loader = DataLoader(
+        trainingset, batch_size=1, shuffle=True, 
+        pin_memory=not pp.device_preload
+    )
+    
+    test_loader = None
     if lp.eval:
-        training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
-        test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
-    else:
-        training_frames=camera_frames
-        test_frames=None
-    trainingset=CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
-    train_loader = DataLoader(trainingset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
-    test_loader=None
-    if lp.eval:
-        testset=CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
-        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
-    norm_trans,norm_radius=trainingset.get_norm()
-
-    #torch parameter
-    cluster_origin=None
-    cluster_extend=None
-    init_points_num=init_xyz.shape[0]
+        testset = CameraFrameDataset(
+            cameras_info, test_frames, lp.resolution, pp.device_preload
+        )
+        test_loader = DataLoader(
+            testset, batch_size=1, shuffle=False, 
+            pin_memory=not pp.device_preload
+        )
+    
+    norm_trans, norm_radius = trainingset.get_norm()
+    
+    # ========== 3. SCHEDULER INITIALIZATION ==========
+    # Prepare images for frequency analysis (if using freq-based scheduling)
+    original_images_for_fft = []
+    if pp.resolution_mode == "freq":
+        for frame in training_frames:
+            original_images_for_fft.append(frame.image[lp.resolution])
+    
+    # Initialize training scheduler for coarse-to-fine resolution scaling
+    init_points_num = init_xyz.shape[0]
+    scheduler = schedule_utils.TrainingScheduler(
+        op, dp, pp, init_points_num, original_images_for_fft
+    )
+    
+    # Free memory after scheduler init
+    del original_images_for_fft
+    torch.cuda.empty_cache()
+    
+    # Get dynamic LR decay iteration from scheduler
+    decay_from_iter = scheduler.lr_decay_from_iter()
+    
+    # ========== 4. MODEL & OPTIMIZER INITIALIZATION ==========
+    cluster_origin, cluster_extend = None, None
+    
     if start_checkpoint is None:
-        init_xyz=torch.tensor(init_xyz,dtype=torch.float32,device='cuda')
-        init_color=torch.tensor(init_color,dtype=torch.float32,device='cuda')
-        xyz,scale,rot,sh_0,sh_rest,opacity=scene.create_gaussians(init_xyz,init_color,lp.sh_degree)
-        if pp.cluster_size:
-            xyz,scale,rot,sh_0,sh_rest,opacity=scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
-        xyz=torch.nn.Parameter(xyz)
-        scale=torch.nn.Parameter(scale)
-        rot=torch.nn.Parameter(rot)
-        sh_0=torch.nn.Parameter(sh_0)
-        sh_rest=torch.nn.Parameter(sh_rest)
-        opacity=torch.nn.Parameter(opacity)
-        opt,schedular=optimizer.get_optimizer(xyz,scale,rot,sh_0,sh_rest,opacity,norm_radius,op,pp)
-        start_epoch=0
+        # Initialize from scratch
+        xyz, scale, rot, sh_0, sh_rest, opacity = _initialize_gaussians(
+            init_xyz, init_color, lp.sh_degree, pp.cluster_size
+        )
+        opt, schedular = optimizer.get_optimizer(
+            xyz, scale, rot, sh_0, sh_rest, opacity,
+            norm_radius, op, pp, decay_from_iter=decay_from_iter
+        )
+        start_epoch = 0
     else:
-        xyz,scale,rot,sh_0,sh_rest,opacity,start_epoch,opt,schedular=io_manager.load_checkpoint(start_checkpoint)
+        # Resume from checkpoint
+        xyz, scale, rot, sh_0, sh_rest, opacity, start_epoch, opt, schedular = \
+            io_manager.load_checkpoint(start_checkpoint)
         if pp.cluster_size:
-            cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
-    actived_sh_degree=0
-
-    #learnable view matrix
+            cluster_origin, cluster_extend = _compute_cluster_aabb(
+                xyz, scale, rot, pp.cluster_size
+            )
+    
+    # ========== 5. ADDITIONAL COMPONENTS ==========
+    actived_sh_degree = 0
+    
+    # Optional: Learnable camera parameters
+    view_params, camera_focal_params, view_opt, proj_opt = None, None, None, None
     if op.learnable_viewproj:
-        view_params=[np.concatenate([frame.qvec,frame.tvec])[None,:] for frame in trainingset.frames]
-        view_params=torch.tensor(np.concatenate(view_params),dtype=torch.float32,device='cuda')
-        view_params=torch.nn.Embedding(view_params.shape[0],view_params.shape[1],_weight=view_params,sparse=True)
-        camera_focal_params=torch.nn.Parameter(torch.tensor(trainingset.cameras[0].focal_x,dtype=torch.float32,device='cuda'))#todo fix multi cameras
-        view_opt=torch.optim.SparseAdam(view_params.parameters(),lr=1e-4)
-        proj_opt=torch.optim.Adam([camera_focal_params,],lr=1e-5)
-
-    #init
-    total_epoch=int(op.iterations/len(trainingset))
-    if dp.densify_until<0:
-        dp.densify_until=int(total_epoch*0.8/dp.opacity_reset_interval)*dp.opacity_reset_interval+1
-    density_controller=densify.DensityControllerTamingGS(norm_radius,dp,pp.cluster_size>0,init_points_num)
-    StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
+        view_params, camera_focal_params, view_opt, proj_opt = \
+            _initialize_learnable_cameras(trainingset)
+    
+    # Densification controller
+    density_controller = densify.DensityControllerTamingGS(
+        norm_radius, dp, pp.cluster_size > 0, init_points_num
+    )
+    
+    # ========== 6. TRAINING SETUP ==========
+    total_epoch = int(op.iterations / len(trainingset))
+    global_step = start_epoch * len(train_loader)
+    res_scale_buffer = []  # Track resolution scaling per step
+    
+    if dp.densify_until < 0:
+        dp.densify_until = int(
+            total_epoch * 0.8 / dp.opacity_reset_interval
+        ) * dp.opacity_reset_interval + 1
+    
+    StatisticsHelperInst.reset(
+        xyz.shape[-2], xyz.shape[-1], density_controller.is_densify_actived
+    )
+    
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
-    progress_bar.update(0)
-
-    # Debug mode initialization
-    debug_dir = None
-    debug_view_data = None
-    last_debug_save_time = None
-    debug_iteration = 0
-    resolution_scheduler = None
-    if pp.debug:
-        debug_dir = os.path.join(lp.model_path, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
-        print(f"Debug mode enabled. Debug visualizations will be saved to: {debug_dir}")
-
-        # Select a fixed view for debugging (use the first training view)
-        debug_view_idx = 0
-        debug_frame = training_frames[debug_view_idx]
-        debug_camera = cameras_info[debug_frame.camera_id]
-
-        # Precompute debug view data
-        debug_dataset = CameraFrameDataset(cameras_info, [debug_frame], lp.resolution, pp.device_preload)
-        debug_loader = DataLoader(debug_dataset, batch_size=1, shuffle=False, pin_memory=not pp.device_preload)
-
-        # Get the view data
-        for view_matrix, proj_matrix, frustumplane, gt_image, idx in debug_loader:
-            debug_view_data = {
-                'view_matrix': view_matrix.cuda(),
-                'proj_matrix': proj_matrix.cuda(),
-                'frustumplane': frustumplane.cuda(),
-                'gt_image': gt_image.cuda() / 255.0,
-                'view_id': debug_view_idx,
-                'resolution': f"{gt_image.shape[3]}x{gt_image.shape[2]}",
-                'camera': debug_camera
-            }
-            break
-
-        last_debug_save_time = time.time()
-
-    # Initialize resolution scheduler (always needed, not just for debug mode)
-    # resolution_scheduler = ResolutionScheduler(num_stages=6, stage_duration=9.0)
-    resolution_scheduler = ResolutionScheduler(op, pp, original_images=None)
-    if pp.debug:
-        print(f"Resolution scheduler initialized with mode: {resolution_scheduler.resolution_mode}")
-
-    # Time-based stopping: track start time for 59.5 second timeout
     training_start_time = time.time()
-    resolution_scheduler.start_timing()
-    elapsed_time = 0.0
-    for epoch in range(start_epoch,total_epoch):
-
-        old_elapsed_time = elapsed_time
+    
+    # ========== 7. MAIN TRAINING LOOP ==========
+    for epoch in range(start_epoch, total_epoch):
+        
+        # Check timeout (60 second limit with buffer)
         elapsed_time = time.time() - training_start_time
-        epoch_time = elapsed_time - old_elapsed_time
-        if elapsed_time >= 59.5 - epoch_time:
-
-            progress_bar.close()
-            # Save the most recent .ply file
-            save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
-            os.makedirs(save_path, exist_ok=True)
-
-            # Save training time as JSON
-            metrics = {
-                "time": elapsed_time,
-                "model_path": lp.model_path,
-                "status": "timeout",
-                "final_epoch": epoch,
-                "total_epochs": total_epoch,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-            metrics_file_path = os.path.join(save_path, "training_metrics.json")
-            with open(metrics_file_path, 'w') as f:
-                json.dump(metrics, f, indent=4)
-            
-            # Save .ply file
-            if pp.cluster_size:
-                tensors = scene.cluster.uncluster(xyz, scale, rot, sh_0, sh_rest, opacity)
-            else:
-                tensors = xyz, scale, rot, sh_0, sh_rest, opacity
-            param_nyp = []
-            for tensor in tensors:
-                param_nyp.append(tensor.detach().cpu().numpy())
-            io_manager.save_ply(os.path.join(save_path, "point_cloud.ply"), *param_nyp)
-            if op.learnable_viewproj:
-                torch.save(list(view_params.parameters())+[camera_focal_params], os.path.join(save_path, "viewproj.pth"))
-
-            print(f"Saved checkpoint to {save_path}")
-            print(f"Training metrics saved to {metrics_file_path}")
+        if _should_timeout(elapsed_time, epoch, start_epoch):
+            _save_timeout_checkpoint(
+                lp, pp, op, epoch, total_epoch, elapsed_time,
+                xyz, scale, rot, sh_0, sh_rest, opacity,
+                res_scale_buffer, view_params, camera_focal_params
+            )
             break
-
+        
+        # Update SH degree progressively and cluster AABB
         with torch.no_grad():
-            if pp.cluster_size>0 and (epoch-1)%dp.densification_interval==0:
-                scene.spatial_refine(pp.cluster_size>0,opt,xyz)
-                cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
-            if actived_sh_degree<lp.sh_degree:
-                actived_sh_degree=min(int(epoch/5),lp.sh_degree)
-
+            if pp.cluster_size > 0 and (epoch - 1) % dp.densification_interval == 0:
+                scene.spatial_refine(pp.cluster_size > 0, opt, xyz)
+                cluster_origin, cluster_extend = _compute_cluster_aabb(
+                    xyz, scale, rot, pp.cluster_size
+                )
+            
+            if actived_sh_degree < lp.sh_degree:
+                actived_sh_degree = min(int(epoch / 5), lp.sh_degree)
+        
+        # Training iteration
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,idx in train_loader:
-                view_matrix=view_matrix.cuda()
-                proj_matrix=proj_matrix.cuda()
-                frustumplane=frustumplane.cuda()
-                gt_image=gt_image.cuda()/255.0
+            for view_matrix, proj_matrix, frustumplane, gt_image, idx in train_loader:
+                
+                # Move data to GPU
+                view_matrix = view_matrix.cuda()
+                proj_matrix = proj_matrix.cuda()
+                frustumplane = frustumplane.cuda()
+                gt_image = gt_image.cuda() / 255.0
+                
+                # === COARSE-TO-FINE RESOLUTION SCALING ===
+                render_scale = scheduler.get_res_scale(global_step)
+                res_scale_buffer.append({
+                    "global_step": global_step,
+                    "render_scale": float(render_scale)
+                })
+                
+                # Downsample GT image if rendering at lower resolution
+                if render_scale > 1:
+                    gt_image = torch.nn.functional.interpolate(
+                        gt_image,
+                        scale_factor=1.0 / render_scale,
+                        mode="bilinear",
+                        recompute_scale_factor=True,
+                        antialias=True
+                    )
+                
+                # Update camera parameters if learnable
                 if op.learnable_viewproj:
-                    #fix view matrix
-                    view_param_vec=view_params(idx.cuda())
-                    qvec=torch.nn.functional.normalize(view_param_vec[:,:4],dim=1)
-                    tvec=view_param_vec[:,4:]
-                    rot_matrix=utils.wrapper.CreateTransformMatrix.call_fused(torch.ones((3,qvec.shape[0]),device='cuda'),qvec.transpose(0,1).contiguous())
-                    view_matrix[:,:3, :3] = rot_matrix.permute(2,0,1)
-                    view_matrix[:,3, :3] = tvec
-
-                    #fix proj matrix
-                    focal_x=camera_focal_params
-                    focal_y=camera_focal_params*gt_image.shape[3]/gt_image.shape[2]
-                    proj_matrix[:,0,0]=focal_x
-                    proj_matrix[:,1,1]=focal_y
-
-                # Get tile size
-                tile_h, tile_w = pp.tile_size if isinstance(pp.tile_size, tuple) else (pp.tile_size, pp.tile_size)
+                    view_matrix, proj_matrix = _update_camera_matrices(
+                        view_params, camera_focal_params, idx,
+                        view_matrix, proj_matrix, gt_image.shape
+                    )
                 
-                # Get downsampled resolution with proper tile alignment
-                full_height = gt_image.shape[2]
-                full_width = gt_image.shape[3]
-                ds_height, ds_width = resolution_scheduler.get_downsampled_dimensions(
-                    full_height, full_width
+                # Render current view
+                visible_chunkid, culled_xyz, culled_scale, culled_rot, \
+                culled_sh_0, culled_sh_rest, culled_opacity = render.render_preprocess(
+                    cluster_origin, cluster_extend, frustumplane,
+                    xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
                 )
-
-                # Debug logging
-                if pp.debug and epoch == start_epoch:
-                    print(f"DEBUG: full={full_height}x{full_width}, ds={ds_height}x{ds_width}, tile={tile_h}x{tile_w}")
-                    print(f"DEBUG: tiles={ds_height//tile_h}x{ds_width//tile_w}")
-
-                # Create downsampled projection matrix
-                proj_matrix_np = proj_matrix.cpu().numpy()[0]
-                downsampled_proj_matrix_np = resolution_scheduler.get_downsampled_proj_matrix(
-                    proj_matrix_np, full_height, full_width
-                )
-                downsampled_proj_matrix = torch.tensor(downsampled_proj_matrix_np, dtype=torch.float32, device='cuda').unsqueeze(0)
-
-                # Create frustum plane for downsampled resolution as PyTorch tensor
-                view_matrix_np = view_matrix.cpu().numpy()[0]
-                viewproj_matrix = view_matrix_np @ downsampled_proj_matrix_np
-
-                # Create as PyTorch tensor directly
-                downsampled_frustumplane = torch.zeros((6, 4), dtype=torch.float32, device='cuda')
-
-                # Fill the frustum planes
-                downsampled_frustumplane[0] = torch.tensor([
-                    viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
-                    viewproj_matrix[1, 3] + viewproj_matrix[1, 0], 
-                    viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
-                    viewproj_matrix[3, 3] + viewproj_matrix[3, 0]
-                ], device='cuda')
-
-                downsampled_frustumplane[1] = torch.tensor([
-                    viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
-                    viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
-                    viewproj_matrix[2, 3] - viewproj_matrix[2, 0], 
-                    viewproj_matrix[3, 3] - viewproj_matrix[3, 0]
-                ], device='cuda')
-
-                downsampled_frustumplane[2] = torch.tensor([
-                    viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
-                    viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
-                    viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
-                    viewproj_matrix[3, 3] + viewproj_matrix[3, 1]
-                ], device='cuda')
-
-                downsampled_frustumplane[3] = torch.tensor([
-                    viewproj_matrix[0, 3] - viewproj_matrix[0, 1], 
-                    viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
-                    viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
-                    viewproj_matrix[3, 3] - viewproj_matrix[3, 1]
-                ], device='cuda')
-
-                downsampled_frustumplane[4] = torch.tensor([
-                    viewproj_matrix[0, 2],
-                    viewproj_matrix[1, 2],
-                    viewproj_matrix[2, 2], 
-                    viewproj_matrix[3, 2]
-                ], device='cuda')
-
-                downsampled_frustumplane[5] = torch.tensor([
-                    viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
-                    viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
-                    viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
-                    viewproj_matrix[3, 3] - viewproj_matrix[3, 2]
-                ], device='cuda')
-
-                downsampled_frustumplane = downsampled_frustumplane.unsqueeze(0)
-
-                # Cluster culling with downsampled frustum
-                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,downsampled_frustumplane,
-                                                                                                               xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
                 
-                # Render at downsampled resolution
-                img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,downsampled_proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
-                                                            actived_sh_degree,(ds_height, ds_width),pp)
-
-                # Downsample GT image to match rendered resolution
-                downsampled_gt = resolution_scheduler.downsample_image_hq(
-                    gt_image,
-                    target_height=ds_height,
-                    target_width=ds_width,
+                img, transmitance, depth, normal, primitive_visible = render.render(
+                    view_matrix, proj_matrix, culled_xyz, culled_scale,
+                    culled_rot, culled_sh_0, culled_sh_rest, culled_opacity,
+                    actived_sh_degree, gt_image.shape[2:], pp
                 )
-
-                # Compute loss on downsampled images
-                l1_loss=__l1_loss(img,downsampled_gt)
-                ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,downsampled_gt)
-                loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
-                loss+=(culled_scale).square().mean()*op.reg_weight
+                
+                # Compute loss
+                img_b = img.unsqueeze(0)  # Add batch dimension
+                l1_loss = __l1_loss(img_b, gt_image)
+                ssim_loss = 1 - fused_ssim.fused_ssim(img_b, gt_image)
+                loss = (1.0 - op.lambda_dssim) * l1_loss + op.lambda_dssim * ssim_loss
+                loss += (culled_scale).square().mean() * op.reg_weight
+                
+                # Backward pass
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
+                
+                # Optimizer step
                 if pp.sparse_grad:
-                    opt.step(visible_chunkid,primitive_visible)
+                    opt.step(visible_chunkid, primitive_visible)
                 else:
                     opt.step()
-                opt.zero_grad(set_to_none = True)
+                opt.zero_grad(set_to_none=True)
+                
+                # Update learnable camera parameters
                 if op.learnable_viewproj:
                     view_opt.step()
                     view_opt.zero_grad()
-                    # proj_opt.step()
-                    # proj_opt.zero_grad()
+                
                 schedular.step()
-                 # Update scheduler with current iteration
-                resolution_scheduler.step()
-
-                # Debug visualization: save every 5 seconds
-                if pp.debug and debug_view_data is not None and resolution_scheduler is not None:
-                    current_time = time.time()
-                    if current_time - last_debug_save_time >= 3.0:
-                        with torch.no_grad():
-                            # Get cluster information for rendering
-                            _cluster_origin = None
-                            _cluster_extend = None
-                            if pp.cluster_size:
-                                _cluster_origin, _cluster_extend = scene.cluster.get_cluster_AABB(
-                                    xyz, scale.exp(), torch.nn.functional.normalize(rot, dim=0)
-                                )
-
-                            # ========== FULL RESOLUTION RENDER (Top Left) ==========
-                            # Use ORIGINAL frustum plane for full resolution
-                            _, full_culled_xyz, full_culled_scale, full_culled_rot, full_culled_sh_0, full_culled_sh_rest, full_culled_opacity = \
-                                render.render_preprocess(
-                                    _cluster_origin, _cluster_extend, debug_view_data['frustumplane'],  # ORIGINAL frustum
-                                    xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
-                                )
-
-                            # Render at FULL resolution with ORIGINAL camera parameters
-                            debug_render, _, _, _, _ = render.render(
-                                debug_view_data['view_matrix'], 
-                                debug_view_data['proj_matrix'],  # ORIGINAL projection matrix
-                                full_culled_xyz, full_culled_scale, full_culled_rot, full_culled_sh_0, full_culled_sh_rest, full_culled_opacity,
-                                actived_sh_degree, 
-                                debug_view_data['gt_image'].shape[2:],  # FULL resolution
-                                pp
-                            )
-
-                            # ========== DOWNSAMPLED RENDER (Bottom Left) ==========
-                            # Get downsampled resolution from scheduler with proper tile alignment
-                            resolution_info = resolution_scheduler.get_info_dict()
-                            full_height = debug_view_data['gt_image'].shape[2]
-                            full_width = debug_view_data['gt_image'].shape[3]
-                            ds_height, ds_width = resolution_scheduler.get_downsampled_dimensions(
-                                full_height, full_width
-                            )
-
-                            # Create downsampled projection matrix
-                            proj_matrix_np = debug_view_data['proj_matrix'].cpu().numpy()[0]
-                            downsampled_proj_matrix_np = resolution_scheduler.get_downsampled_proj_matrix(
-                                proj_matrix_np, full_height, full_width
-                            )
-                            downsampled_proj_matrix = torch.tensor(downsampled_proj_matrix_np, dtype=torch.float32, device='cuda').unsqueeze(0)
-
-                            # Create frustum plane for downsampled resolution as PyTorch tensor
-                            view_matrix_np = debug_view_data['view_matrix'].cpu().numpy()[0]
-                            viewproj_matrix = view_matrix_np @ downsampled_proj_matrix_np
-
-                            # Create as PyTorch tensor directly
-                            downsampled_frustumplane = torch.zeros((6, 4), dtype=torch.float32, device='cuda')
-
-                            # Fill the frustum planes
-                            downsampled_frustumplane[0] = torch.tensor([
-                                viewproj_matrix[0, 3] + viewproj_matrix[0, 0],
-                                viewproj_matrix[1, 3] + viewproj_matrix[1, 0], 
-                                viewproj_matrix[2, 3] + viewproj_matrix[2, 0],
-                                viewproj_matrix[3, 3] + viewproj_matrix[3, 0]
-                            ], device='cuda')
-
-                            downsampled_frustumplane[1] = torch.tensor([
-                                viewproj_matrix[0, 3] - viewproj_matrix[0, 0],
-                                viewproj_matrix[1, 3] - viewproj_matrix[1, 0],
-                                viewproj_matrix[2, 3] - viewproj_matrix[2, 0], 
-                                viewproj_matrix[3, 3] - viewproj_matrix[3, 0]
-                            ], device='cuda')
-
-                            downsampled_frustumplane[2] = torch.tensor([
-                                viewproj_matrix[0, 3] + viewproj_matrix[0, 1],
-                                viewproj_matrix[1, 3] + viewproj_matrix[1, 1],
-                                viewproj_matrix[2, 3] + viewproj_matrix[2, 1],
-                                viewproj_matrix[3, 3] + viewproj_matrix[3, 1]
-                            ], device='cuda')
-
-                            downsampled_frustumplane[3] = torch.tensor([
-                                viewproj_matrix[0, 3] - viewproj_matrix[0, 1], 
-                                viewproj_matrix[1, 3] - viewproj_matrix[1, 1],
-                                viewproj_matrix[2, 3] - viewproj_matrix[2, 1],
-                                viewproj_matrix[3, 3] - viewproj_matrix[3, 1]
-                            ], device='cuda')
-
-                            downsampled_frustumplane[4] = torch.tensor([
-                                viewproj_matrix[0, 2],
-                                viewproj_matrix[1, 2],
-                                viewproj_matrix[2, 2], 
-                                viewproj_matrix[3, 2]
-                            ], device='cuda')
-
-                            downsampled_frustumplane[5] = torch.tensor([
-                                viewproj_matrix[0, 3] - viewproj_matrix[0, 2],
-                                viewproj_matrix[1, 3] - viewproj_matrix[1, 2],
-                                viewproj_matrix[2, 3] - viewproj_matrix[2, 2],
-                                viewproj_matrix[3, 3] - viewproj_matrix[3, 2]
-                            ], device='cuda')
-
-                            downsampled_frustumplane = downsampled_frustumplane.unsqueeze(0)
-
-                            # Use DOWNsampled frustum for training resolution render
-                            _, ds_culled_xyz, ds_culled_scale, ds_culled_rot, ds_culled_sh_0, ds_culled_sh_rest, ds_culled_opacity = \
-                                render.render_preprocess(
-                                    _cluster_origin, _cluster_extend, downsampled_frustumplane,  # DOWNsampled frustum
-                                    xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
-                                )
-
-                            # Render at downsampled resolution
-                            downsampled_render, _, _, _, _ = render.render(
-                                debug_view_data['view_matrix'], 
-                                downsampled_proj_matrix,  # DOWNsampled projection
-                                ds_culled_xyz, ds_culled_scale, ds_culled_rot, ds_culled_sh_0, ds_culled_sh_rest, ds_culled_opacity,
-                                actived_sh_degree, 
-                                (ds_height, ds_width),  # DOWNsampled resolution
-                                pp
-                            )
-
-                            # Downsample the GT image using high-quality method
-                            downsampled_gt = resolution_scheduler.downsample_image_hq(
-                                debug_view_data['gt_image'],
-                                target_height=ds_height,
-                                target_width=ds_width,
-                            )
-
-                            # Save the debug visualization
-                            __save_debug_view(
-                                debug_dir, debug_iteration,
-                                debug_render[0], debug_view_data['gt_image'][0],  # Full res render vs full res GT
-                                debug_view_data['view_id'], debug_view_data['resolution'],
-                                downsampled_render[0], downsampled_gt[0],  # Downsampled render vs downsampled GT
-                                resolution_info
-                            )
-
-                            debug_iteration += 1
-                            last_debug_save_time = current_time
-
+                global_step += 1
+        
+        # Evaluation
         if epoch in test_epochs:
-            with torch.no_grad():
-                _cluster_origin=None
-                _cluster_extend=None
-                if pp.cluster_size:
-                    _cluster_origin,_cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
-                psnr_metrics=psnr.PeakSignalNoiseRatio(data_range=(0.0,1.0)).cuda()
-                loaders={"Trainingset":train_loader}
-                if lp.eval:
-                    loaders["Testset"]=test_loader
-                for name,loader in loaders.items():
-                    psnr_list=[]
-                    for view_matrix,proj_matrix,frustumplane,gt_image,idx in loader:
-                        view_matrix=view_matrix.cuda()
-                        proj_matrix=proj_matrix.cuda()
-                        frustumplane=frustumplane.cuda()
-                        gt_image=gt_image.cuda()/255.0
-
-                        if name=="Trainingset" and op.learnable_viewproj:
-                            view_param_vec=view_params(idx.cuda())
-                            qvec=torch.nn.functional.normalize(view_param_vec[:,:4],dim=1)
-                            tvec=view_param_vec[:,4:]
-                            rot_matrix=utils.wrapper.CreateTransformMatrix.call_fused(torch.ones((3,qvec.shape[0]),device='cuda'),qvec.transpose(0,1).contiguous())
-                            view_matrix[:,:3, :3] = rot_matrix.permute(2,0,1)
-                            view_matrix[:,3, :3] = tvec
-
-                            focal_x=camera_focal_params
-                            focal_y=camera_focal_params*gt_image.shape[3]/gt_image.shape[2]
-                            proj_matrix[:,0,0]=focal_x
-                            proj_matrix[:,1,1]=focal_y
-
-                        _,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=render.render_preprocess(_cluster_origin,_cluster_extend,frustumplane,
-                                                                                                                xyz,scale,rot,sh_0,sh_rest,opacity,op,pp)
-                        img,transmitance,depth,normal,_=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,
-                                                                    actived_sh_degree,gt_image.shape[2:],pp)
-                        psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
-                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
-
-        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
+            _run_evaluation(
+                epoch, train_loader, test_loader, lp, op, pp,
+                xyz, scale, rot, sh_0, sh_rest, opacity,
+                actived_sh_degree, view_params, camera_focal_params
+            )
+        
+        # Densification step
+        xyz, scale, rot, sh_0, sh_rest, opacity = density_controller.step(opt, epoch)
         progress_bar.update()
-
-        if epoch in save_ply or epoch==total_epoch-1:
-            if epoch==total_epoch-1:
-                progress_bar.close()
-                elapsed_time = progress_bar.format_dict['elapsed']
-                print("{} takes: {} s".format(lp.model_path, elapsed_time))
-                save_path=os.path.join(lp.model_path,"point_cloud","finish")
-            else:
-                elapsed_time = time.time() - training_start_time
-                save_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch))
-
-            # Create directory
-            os.makedirs(save_path, exist_ok=True)
-            
-            # Save training time as JSON
-            metrics = {
-                "time": elapsed_time,
-                "model_path": lp.model_path,
-                "status": "completed" if epoch == total_epoch-1 else "checkpoint",
-                "epoch": epoch,
-                "total_epochs": total_epoch,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            with open(os.path.join(save_path, "training_metrics.json"), 'w') as f:
-                json.dump(metrics, f, indent=4)
-            
-            # Save .ply file
-            if pp.cluster_size:
-                tensors=scene.cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
-            else:
-                tensors=xyz,scale,rot,sh_0,sh_rest,opacity
-            param_nyp=[]
-            for tensor in tensors:
-                param_nyp.append(tensor.detach().cpu().numpy())
-            io_manager.save_ply(os.path.join(save_path,"point_cloud.ply"),*param_nyp)
-            if op.learnable_viewproj:
-                torch.save(list(view_params.parameters())+[camera_focal_params],os.path.join(save_path,"viewproj.pth"))
-            
-            print(f"Training metrics saved to {os.path.join(save_path, 'training_metrics.json')}")
-
+        
+        # Save checkpoints
+        if epoch in save_ply or epoch == total_epoch - 1:
+            elapsed_time = time.time() - training_start_time
+            _save_model_checkpoint(
+                lp, pp, op, epoch, total_epoch, elapsed_time,
+                xyz, scale, rot, sh_0, sh_rest, opacity,
+                res_scale_buffer, view_params, camera_focal_params,
+                is_final=(epoch == total_epoch - 1)
+            )
+        
         if epoch in save_checkpoint:
-            io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)
+            io_manager.save_checkpoint(lp.model_path, epoch, opt, schedular)
     
+    progress_bar.close()
     return
+
+
+# ========== HELPER FUNCTIONS ==========
+
+def _load_scene_data(lp: arguments.ModelParams):
+    """Load camera info and 3D points from COLMAP or SLAM."""
+    if lp.source_type == "colmap":
+        return io_manager.load_colmap_result(lp.source_path, lp.images)
+    elif lp.source_type == "slam":
+        return io_manager.load_slam_result(lp.source_path)
+    else:
+        raise ValueError(f"Unknown source type: {lp.source_type}")
+
+
+def _create_train_test_split(source_path: str, camera_frames: list, eval_mode: bool):
+    """Create train/test split from JSON or default 8-fold split."""
+    split_json_path = os.path.join(source_path, "train_test_split.json")
+    
+    if os.path.exists(split_json_path):
+        with open(split_json_path, 'r') as f:
+            split_data = json.load(f)
+        train_names = set(split_data.get("train", []))
+        test_names = set(split_data.get("test", []))
+        
+        training_frames = [c for c in camera_frames if c.name in train_names]
+        test_frames = [c for c in camera_frames if c.name in test_names] if eval_mode else None
+        
+        print(f"Loaded split: {len(training_frames)} train, "
+              f"{len(test_frames) if test_frames else 0} test images")
+    else:
+        # Default: every 8th frame for testing
+        if eval_mode:
+            training_frames = [c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
+            test_frames = [c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
+        else:
+            training_frames = camera_frames
+            test_frames = None
+    
+    return training_frames, test_frames
+
+
+def _initialize_gaussians(init_xyz, init_color, sh_degree, cluster_size):
+    """Initialize 3D Gaussian parameters."""
+    init_xyz = torch.tensor(init_xyz, dtype=torch.float32, device='cuda')
+    init_color = torch.tensor(init_color, dtype=torch.float32, device='cuda')
+    
+    xyz, scale, rot, sh_0, sh_rest, opacity = scene.create_gaussians(
+        init_xyz, init_color, sh_degree
+    )
+    
+    # Optional clustering for memory efficiency
+    if cluster_size:
+        xyz, scale, rot, sh_0, sh_rest, opacity = scene.cluster.cluster_points(
+            cluster_size, xyz, scale, rot, sh_0, sh_rest, opacity
+        )
+    
+    # Convert to learnable parameters
+    return (
+        torch.nn.Parameter(xyz),
+        torch.nn.Parameter(scale),
+        torch.nn.Parameter(rot),
+        torch.nn.Parameter(sh_0),
+        torch.nn.Parameter(sh_rest),
+        torch.nn.Parameter(opacity)
+    )
+
+
+def _compute_cluster_aabb(xyz, scale, rot, cluster_size):
+    """Compute cluster axis-aligned bounding boxes."""
+    if cluster_size > 0:
+        return scene.cluster.get_cluster_AABB(
+            xyz, scale.exp(), torch.nn.functional.normalize(rot, dim=0)
+        )
+    return None, None
+
+
+def _initialize_learnable_cameras(trainingset):
+    """Initialize learnable camera pose and intrinsic parameters."""
+    # Camera poses (rotation + translation)
+    view_params = [
+        np.concatenate([frame.qvec, frame.tvec])[None, :]
+        for frame in trainingset.frames
+    ]
+    view_params = torch.tensor(
+        np.concatenate(view_params), dtype=torch.float32, device='cuda'
+    )
+    view_params = torch.nn.Embedding(
+        view_params.shape[0], view_params.shape[1],
+        _weight=view_params, sparse=True
+    )
+    
+    # Camera focal length
+    camera_focal_params = torch.nn.Parameter(
+        torch.tensor(trainingset.cameras[0].focal_x, dtype=torch.float32, device='cuda')
+    )
+    
+    # Optimizers
+    view_opt = torch.optim.SparseAdam(view_params.parameters(), lr=1e-4)
+    proj_opt = torch.optim.Adam([camera_focal_params], lr=1e-5)
+    
+    return view_params, camera_focal_params, view_opt, proj_opt
+
+
+def _update_camera_matrices(view_params, camera_focal_params, idx, 
+                            view_matrix, proj_matrix, gt_shape):
+    """Update view and projection matrices with learnable parameters."""
+    view_param_vec = view_params(idx.cuda())
+    qvec = torch.nn.functional.normalize(view_param_vec[:, :4], dim=1)
+    tvec = view_param_vec[:, 4:]
+    
+    rot_matrix = utils.wrapper.CreateTransformMatrix.call_fused(
+        torch.ones((3, qvec.shape[0]), device='cuda'),
+        qvec.transpose(0, 1).contiguous()
+    )
+    
+    view_matrix[:, :3, :3] = rot_matrix.permute(2, 0, 1)
+    view_matrix[:, 3, :3] = tvec
+    
+    # Update focal length in projection matrix
+    focal_x = camera_focal_params
+    focal_y = camera_focal_params * gt_shape[3] / gt_shape[2]
+    proj_matrix[:, 0, 0] = focal_x
+    proj_matrix[:, 1, 1] = focal_y
+    
+    return view_matrix, proj_matrix
+
+
+def _should_timeout(elapsed_time: float, current_epoch: int, start_epoch: int) -> bool:
+    """Check if training should timeout (60 second limit with buffer)."""
+    if current_epoch == start_epoch:
+        return False
+    avg_epoch_time = elapsed_time / (current_epoch - start_epoch)
+    return elapsed_time >= 60 - avg_epoch_time - 0.5
+
+
+def _save_timeout_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
+                             xyz, scale, rot, sh_0, sh_rest, opacity,
+                             res_scale_buffer, view_params, camera_focal_params):
+    """Save checkpoint when training times out."""
+    save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Save metrics
+    metrics = {
+        "time": elapsed_time,
+        "model_path": lp.model_path,
+        "status": "timeout",
+        "final_epoch": epoch,
+        "total_epochs": total_epoch,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    with open(os.path.join(save_path, "training_metrics.json"), 'w') as f:
+        json.dump(metrics, f, indent=4)
+    
+    # Save resolution schedule
+    with open(os.path.join(save_path, "res_scale.json"), 'w') as f:
+        json.dump(res_scale_buffer, f, indent=4)
+    
+    # Save point cloud
+    _save_point_cloud(save_path, pp, xyz, scale, rot, sh_0, sh_rest, opacity)
+    
+    # Save learnable camera parameters
+    if op.learnable_viewproj:
+        torch.save(
+            list(view_params.parameters()) + [camera_focal_params],
+            os.path.join(save_path, "viewproj.pth")
+        )
+    
+    print(f"Timeout checkpoint saved to {save_path}")
+
+
+def _save_model_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
+                           xyz, scale, rot, sh_0, sh_rest, opacity,
+                           res_scale_buffer, view_params, camera_focal_params,
+                           is_final: bool):
+    """Save model checkpoint at specified epochs."""
+    if is_final:
+        save_path = os.path.join(lp.model_path, "point_cloud", "finish")
+        status = "completed"
+    else:
+        save_path = os.path.join(lp.model_path, "point_cloud", f"iteration_{epoch}")
+        status = "checkpoint"
+    
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Save metrics
+    metrics = {
+        "time": elapsed_time,
+        "model_path": lp.model_path,
+        "status": status,
+        "epoch": epoch,
+        "total_epochs": total_epoch,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    with open(os.path.join(save_path, "training_metrics.json"), 'w') as f:
+        json.dump(metrics, f, indent=4)
+    
+    # Save resolution schedule
+    with open(os.path.join(save_path, "res_scale.json"), 'w') as f:
+        json.dump(res_scale_buffer, f, indent=4)
+    
+    # Save point cloud
+    _save_point_cloud(save_path, pp, xyz, scale, rot, sh_0, sh_rest, opacity)
+    
+    # Save learnable camera parameters
+    if op.learnable_viewproj:
+        torch.save(
+            list(view_params.parameters()) + [camera_focal_params],
+            os.path.join(save_path, "viewproj.pth")
+        )
+    
+    if is_final:
+        print(f"{lp.model_path} training completed in {elapsed_time:.2f}s")
+
+
+def _save_point_cloud(save_path, pp, xyz, scale, rot, sh_0, sh_rest, opacity):
+    """Save 3D Gaussian point cloud to PLY file."""
+    if pp.cluster_size:
+        tensors = scene.cluster.uncluster(xyz, scale, rot, sh_0, sh_rest, opacity)
+    else:
+        tensors = (xyz, scale, rot, sh_0, sh_rest, opacity)
+    
+    param_nyp = [tensor.detach().cpu().numpy() for tensor in tensors]
+    io_manager.save_ply(os.path.join(save_path, "point_cloud.ply"), *param_nyp)
+
+
+def _run_evaluation(epoch, train_loader, test_loader, lp, op, pp,
+                   xyz, scale, rot, sh_0, sh_rest, opacity,
+                   actived_sh_degree, view_params, camera_focal_params):
+    """Run PSNR evaluation on train and test sets."""
+    with torch.no_grad():
+        _cluster_origin, _cluster_extend = _compute_cluster_aabb(
+            xyz, scale, rot, pp.cluster_size
+        )
+        
+        psnr_metrics = psnr.PeakSignalNoiseRatio(data_range=(0.0, 1.0)).cuda()
+        
+        loaders = {"Trainingset": train_loader}
+        if lp.eval:
+            loaders["Testset"] = test_loader
+        
+        for name, loader in loaders.items():
+            psnr_list = []
+            
+            for view_matrix, proj_matrix, frustumplane, gt_image, idx in loader:
+                view_matrix = view_matrix.cuda()
+                proj_matrix = proj_matrix.cuda()
+                frustumplane = frustumplane.cuda()
+                gt_image = gt_image.cuda() / 255.0
+                
+                # Update camera matrices for training set
+                if name == "Trainingset" and op.learnable_viewproj:
+                    view_matrix, proj_matrix = _update_camera_matrices(
+                        view_params, camera_focal_params, idx,
+                        view_matrix, proj_matrix, gt_image.shape
+                    )
+                
+                # Render
+                _, culled_xyz, culled_scale, culled_rot, culled_sh_0, \
+                culled_sh_rest, culled_opacity = render.render_preprocess(
+                    _cluster_origin, _cluster_extend, frustumplane,
+                    xyz, scale, rot, sh_0, sh_rest, opacity, op, pp
+                )
+                
+                img, _, _, _, _ = render.render(
+                    view_matrix, proj_matrix, culled_xyz, culled_scale,
+                    culled_rot, culled_sh_0, culled_sh_rest, culled_opacity,
+                    actived_sh_degree, gt_image.shape[2:], pp
+                )
+                
+                psnr_list.append(psnr_metrics(img, gt_image).unsqueeze(0))
+            
+            avg_psnr = torch.concat(psnr_list, dim=0).mean()
+            tqdm.write(f"\n[EPOCH {epoch}] {name} PSNR: {avg_psnr:.4f}")
+
+
+def __l1_loss(network_output: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Compute L1 loss between network output and ground truth."""
+    return torch.abs(network_output - gt).mean()

@@ -1,4 +1,4 @@
-name: DDinoGS
+name: DeadlineDinosaur
 channels:
   - nvidia/label/cuda-12.1.0
   - conda-forge

@@ -89,21 +89,34 @@ def evaluate(args):
             results.append(psnr)
             print(f"  → {scene_name}: PSNR = {psnr:.2f}")
             
-            # Load training time - find the timeout checkpoint with highest epoch
+            # --- MODIFIED: Load training time from finish or timeout directories ---
             time_seconds = None
             point_cloud_dir = os.path.join(model_path, "point_cloud")
             if os.path.exists(point_cloud_dir):
-                timeout_dirs = [d for d in os.listdir(point_cloud_dir) if d.startswith("timeout_epoch_")]
-                if timeout_dirs:
-                    # Use the timeout checkpoint with the highest epoch number
-                    timeout_dirs.sort(key=lambda x: int(x.split("_")[-1]), reverse=True)
-                    training_json = os.path.join(point_cloud_dir, timeout_dirs[0], "training_metrics.json")
-                    if os.path.exists(training_json):
-                        with open(training_json) as f:
-                            train_data = json.load(f)
-                            time_seconds = train_data.get("time", None)
-                            if time_seconds is not None:
-                                times.append(time_seconds)
+                # First check the 'finish' directory (highest priority)
+                finish_json = os.path.join(point_cloud_dir, "finish", "training_metrics.json")
+                if os.path.exists(finish_json):
+                    with open(finish_json) as f:
+                        train_data = json.load(f)
+                        time_seconds = train_data.get("time", None)
+                        if time_seconds is not None:
+                            times.append(time_seconds)
+                            print(f"  → Loaded time from finish: {time_seconds:.2f}s")
+                else:
+                    # Fall back to timeout directories
+                    timeout_dirs = [d for d in os.listdir(point_cloud_dir) if d.startswith("timeout_epoch_")]
+                    if timeout_dirs:
+                        # Use the timeout checkpoint with the highest epoch number
+                        timeout_dirs.sort(key=lambda x: int(x.split("_")[-1]), reverse=True)
+                        training_json = os.path.join(point_cloud_dir, timeout_dirs[0], "training_metrics.json")
+                        if os.path.exists(training_json):
+                            with open(training_json) as f:
+                                train_data = json.load(f)
+                                time_seconds = train_data.get("time", None)
+                                if time_seconds is not None:
+                                    times.append(time_seconds)
+                                    print(f"  → Loaded time from timeout: {time_seconds:.2f}s")
+            # --- END MODIFIED ---
             
             # Save metrics.json
             metrics_data = {

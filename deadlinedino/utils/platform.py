@@ -13,8 +13,7 @@ def __empty_compile(model,*args,**kwargs):
 if plat == 'windows':
     platform_torch_compile=__empty_compile
 elif plat == 'linux':
-    # Use torch.compile if available (PyTorch 2.0+), otherwise use fallback
-    platform_torch_compile = getattr(torch, 'compile', __empty_compile)
+    platform_torch_compile=torch.compile
 
 
 #load dynamic library

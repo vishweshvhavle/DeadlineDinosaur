@@ -14,7 +14,7 @@ import deadlinedino.config
 import deadlinedino.utils
 import shutil
 
-OUTPUT_FILE=True
+OUTPUT_FILE=False
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
