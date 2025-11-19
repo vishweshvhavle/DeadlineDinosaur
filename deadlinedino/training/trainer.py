@@ -131,9 +131,9 @@ def start(
         view_params, camera_focal_params, view_opt, proj_opt = \
             _initialize_learnable_cameras(trainingset)
     
-    # Densification controller
+    # Densification controller (pass scheduler for momentum-based primitive budgeting)
     density_controller = densify.DensityControllerTamingGS(
-        norm_radius, dp, pp.cluster_size > 0, init_points_num
+        norm_radius, dp, pp.cluster_size > 0, init_points_num, scheduler
     )
     
     # ========== 6. TRAINING SETUP ==========
@@ -260,7 +260,12 @@ def start(
             )
         
         # Densification step
-        xyz, scale, rot, sh_0, sh_rest, opacity = density_controller.step(opt, epoch)
+        (xyz, scale, rot, sh_0, sh_rest, opacity), num_added = density_controller.step(opt, epoch)
+
+        # Update momentum-based primitive budgeting
+        if num_added > 0:
+            scheduler.update_momentum(num_added)
+
         progress_bar.update()
         
         # Save checkpoints

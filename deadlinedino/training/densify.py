@@ -218,7 +218,7 @@ class DensityControllerOfficial(DensityControllerBase):
         
         #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_mask.sum().cpu(),split_mask.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
+        return 0  # Base class doesn't track momentum
     
     @torch.no_grad()
     def reset_opacity(self,optimizer:torch.optim.Optimizer,epoch:int):
@@ -244,10 +244,11 @@ class DensityControllerOfficial(DensityControllerBase):
 
     @torch.no_grad()
     def step(self,optimizer:torch.optim.Optimizer,epoch:int):
+        num_added = 0  # Track number of primitives added for momentum
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
-                self.split_and_clone(optimizer,epoch)
+                num_added = self.split_and_clone(optimizer,epoch)
                 self.prune(optimizer,epoch)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -257,15 +258,16 @@ class DensityControllerOfficial(DensityControllerBase):
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
                 StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
-        return self._get_params_from_optimizer(optimizer)
+        return self._get_params_from_optimizer(optimizer), num_added
     
 
 class DensityControllerTamingGS(DensityControllerOfficial):
     @torch.no_grad()
-    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool,init_points_num:int)->None:
+    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool,init_points_num:int,scheduler=None)->None:
 
         assert(densify_params.target_primitives!=0.0)
         self.target_points_num=densify_params.target_primitives
+        self.scheduler = scheduler  # Store scheduler for dynamic target
         super(DensityControllerTamingGS,self).__init__(screen_extent,densify_params,bCluster,init_points_num)
         return
     
@@ -293,7 +295,7 @@ class DensityControllerTamingGS(DensityControllerOfficial):
     
     @torch.no_grad()
     def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
-        
+
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
             chunk_size=xyz.shape[-1]
@@ -301,8 +303,13 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
         prune_num=self.get_prune_mask(opacity.sigmoid(),scale.exp()).sum()
 
-        cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
-        budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
+        # Use scheduler's dynamic target if available (momentum-based), otherwise use static target
+        if self.scheduler is not None and self.scheduler.momentum != -1:
+            target_count = self.scheduler.max_n_gaussian
+        else:
+            target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
+
+        budget=min(max(int(target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
         densify_index = torch.multinomial(score, budget, replacement=False)
@@ -357,8 +364,14 @@ class DensityControllerTamingGS(DensityControllerOfficial):
                       "sh_0": append_sh_0,
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
-        
+
+        # Calculate number of primitives added for momentum update
+        if self.bCluster:
+            num_added = append_xyz.shape[-1] * append_xyz.shape[-2]
+        else:
+            num_added = append_xyz.shape[-1]
+
         #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_index.sum().cpu(),split_index.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
+        return num_added
     
