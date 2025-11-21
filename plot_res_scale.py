@@ -115,11 +115,6 @@ def plot_resolution_scales(args):
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"\n✓ Saved plot to {plot_path}")
     
-    # Also save as PDF for better quality
-    pdf_path = os.path.join(output_dir, "resolution_scales_plot.pdf")
-    plt.savefig(pdf_path, bbox_inches='tight')
-    print(f"✓ Saved plot to {pdf_path}")
-    
     plt.show()
     
     # Print summary

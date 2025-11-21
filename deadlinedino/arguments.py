@@ -104,13 +104,11 @@ class OptimizationParams(ParamGroup):
 class DensifyParams(ParamGroup):
     densification_interval = 5
     densify_from = 3
-    densify_until = 3000
+    densify_until = 2000
     opacity_reset_interval = 10
     opacity_reset_mode='decay'#'decay','reset'
     prune_mode='weight'#'weight','threshold'
     target_primitives=1000000
-    
-
 
     #discard
     densify_grad_threshold = 0.00015

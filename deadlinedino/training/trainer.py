@@ -34,23 +34,17 @@ def start(
     start_checkpoint: str = None
 ):
     """
-    Main training loop for 3D Gaussian Splatting with coarse-to-fine resolution scheduling.
+    Main training loop with DashGaussian momentum-based primitive budgeting.
     
-    Args:
-        lp: Model parameters (source path, resolution, SH degree)
-        op: Optimization parameters (iterations, learning rates, regularization)
-        pp: Pipeline parameters (device settings, clustering, resolution mode)
-        dp: Densification parameters (pruning, splitting intervals)
-        test_epochs: List of epochs to run evaluation
-        save_ply: List of epochs to save point cloud
-        save_checkpoint: List of epochs to save full checkpoint
-        start_checkpoint: Path to checkpoint for resuming training
+    Implements:
+    - Progressive resolution training (coarse-to-fine)
+    - Momentum-based primitive budgeting (DashGaussian Eq. 5)
+    - Synchronized resolution and primitive growth
     """
     
     # ========== 1. DATA LOADING ==========
     cameras_info, camera_frames, init_xyz, init_color = _load_scene_data(lp)
     
-    # Preload all images to memory
     for frame in camera_frames:
         frame.load_image(lp.resolution)
     
@@ -59,7 +53,6 @@ def start(
         lp.source_path, camera_frames, lp.eval
     )
     
-    # Create data loaders
     trainingset = CameraFrameDataset(
         cameras_info, training_frames, lp.resolution, pp.device_preload
     )
@@ -81,30 +74,25 @@ def start(
     norm_trans, norm_radius = trainingset.get_norm()
     
     # ========== 3. SCHEDULER INITIALIZATION ==========
-    # Prepare images for frequency analysis (if using freq-based scheduling)
     original_images_for_fft = []
     if pp.resolution_mode == "freq":
         for frame in training_frames:
             original_images_for_fft.append(frame.image[lp.resolution])
     
-    # Initialize training scheduler for coarse-to-fine resolution scaling
     init_points_num = init_xyz.shape[0]
     scheduler = schedule_utils.TrainingScheduler(
         op, dp, pp, init_points_num, original_images_for_fft
     )
     
-    # Free memory after scheduler init
     del original_images_for_fft
     torch.cuda.empty_cache()
     
-    # Get dynamic LR decay iteration from scheduler
     decay_from_iter = scheduler.lr_decay_from_iter()
     
     # ========== 4. MODEL & OPTIMIZER INITIALIZATION ==========
     cluster_origin, cluster_extend = None, None
     
     if start_checkpoint is None:
-        # Initialize from scratch
         xyz, scale, rot, sh_0, sh_rest, opacity = _initialize_gaussians(
             init_xyz, init_color, lp.sh_degree, pp.cluster_size
         )
@@ -114,7 +102,6 @@ def start(
         )
         start_epoch = 0
     else:
-        # Resume from checkpoint
         xyz, scale, rot, sh_0, sh_rest, opacity, start_epoch, opt, schedular = \
             io_manager.load_checkpoint(start_checkpoint)
         if pp.cluster_size:
@@ -125,21 +112,20 @@ def start(
     # ========== 5. ADDITIONAL COMPONENTS ==========
     actived_sh_degree = 0
     
-    # Optional: Learnable camera parameters
     view_params, camera_focal_params, view_opt, proj_opt = None, None, None, None
     if op.learnable_viewproj:
         view_params, camera_focal_params, view_opt, proj_opt = \
             _initialize_learnable_cameras(trainingset)
     
-    # Densification controller
+    # Densification controller with scheduler for momentum-based budgeting
     density_controller = densify.DensityControllerTamingGS(
-        norm_radius, dp, pp.cluster_size > 0, init_points_num
+        norm_radius, dp, pp.cluster_size > 0, init_points_num, scheduler
     )
     
     # ========== 6. TRAINING SETUP ==========
     total_epoch = int(op.iterations / len(trainingset))
     global_step = start_epoch * len(train_loader)
-    res_scale_buffer = []  # Track resolution scaling per step
+    res_scale_buffer = []
     
     if dp.densify_until < 0:
         dp.densify_until = int(
@@ -153,10 +139,13 @@ def start(
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     training_start_time = time.time()
     
+    print(f"[TRAINING] Starting: {init_points_num} primitives, {total_epoch} epochs")
+    print(f"[TRAINING] Densify: {dp.densify_from} -> {dp.densify_until}, interval={dp.densification_interval}")
+    
     # ========== 7. MAIN TRAINING LOOP ==========
     for epoch in range(start_epoch, total_epoch):
         
-        # Check timeout (60 second limit with buffer)
+        # Check timeout (60 second limit)
         elapsed_time = time.time() - training_start_time
         if _should_timeout(elapsed_time, epoch, start_epoch):
             _save_timeout_checkpoint(
@@ -166,7 +155,7 @@ def start(
             )
             break
         
-        # Update SH degree progressively and cluster AABB
+        # Update SH degree and cluster AABB
         with torch.no_grad():
             if pp.cluster_size > 0 and (epoch - 1) % dp.densification_interval == 0:
                 scene.spatial_refine(pp.cluster_size > 0, opt, xyz)
@@ -181,20 +170,19 @@ def start(
         with StatisticsHelperInst.try_start(epoch):
             for view_matrix, proj_matrix, frustumplane, gt_image, idx in train_loader:
                 
-                # Move data to GPU
                 view_matrix = view_matrix.cuda()
                 proj_matrix = proj_matrix.cuda()
                 frustumplane = frustumplane.cuda()
                 gt_image = gt_image.cuda() / 255.0
                 
-                # === COARSE-TO-FINE RESOLUTION SCALING ===
+                # Progressive resolution scheduling
                 render_scale = scheduler.get_res_scale(global_step)
                 res_scale_buffer.append({
                     "global_step": global_step,
                     "render_scale": float(render_scale)
                 })
                 
-                # Downsample GT image if rendering at lower resolution
+                # Downsample GT at lower resolutions
                 if render_scale > 1:
                     gt_image = torch.nn.functional.interpolate(
                         gt_image,
@@ -204,14 +192,13 @@ def start(
                         antialias=True
                     )
                 
-                # Update camera parameters if learnable
                 if op.learnable_viewproj:
                     view_matrix, proj_matrix = _update_camera_matrices(
                         view_params, camera_focal_params, idx,
                         view_matrix, proj_matrix, gt_image.shape
                     )
                 
-                # Render current view
+                # Render
                 visible_chunkid, culled_xyz, culled_scale, culled_rot, \
                 culled_sh_0, culled_sh_rest, culled_opacity = render.render_preprocess(
                     cluster_origin, cluster_extend, frustumplane,
@@ -224,14 +211,14 @@ def start(
                     actived_sh_degree, gt_image.shape[2:], pp
                 )
                 
-                # Compute loss
-                img_b = img.unsqueeze(0)  # Add batch dimension
+                # Loss
+                img_b = img.unsqueeze(0)
                 l1_loss = __l1_loss(img_b, gt_image)
                 ssim_loss = 1 - fused_ssim.fused_ssim(img_b, gt_image)
                 loss = (1.0 - op.lambda_dssim) * l1_loss + op.lambda_dssim * ssim_loss
                 loss += (culled_scale).square().mean() * op.reg_weight
                 
-                # Backward pass
+                # Backward
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -243,7 +230,6 @@ def start(
                     opt.step()
                 opt.zero_grad(set_to_none=True)
                 
-                # Update learnable camera parameters
                 if op.learnable_viewproj:
                     view_opt.step()
                     view_opt.zero_grad()
@@ -259,8 +245,14 @@ def start(
                 actived_sh_degree, view_params, camera_focal_params
             )
         
-        # Densification step
-        xyz, scale, rot, sh_0, sh_rest, opacity = density_controller.step(opt, epoch)
+        # Densification with momentum update
+        (xyz, scale, rot, sh_0, sh_rest, opacity), num_added = density_controller.step(opt, epoch)
+
+        # Update momentum-based primitive budget with resolution-adaptive scaling
+        if num_added > 0:
+            current_scale = scheduler.get_res_scale(global_step)
+            scheduler.update_momentum(num_added, global_step, current_scale)
+
         progress_bar.update()
         
         # Save checkpoints
@@ -308,7 +300,6 @@ def _create_train_test_split(source_path: str, camera_frames: list, eval_mode: b
         print(f"Loaded split: {len(training_frames)} train, "
               f"{len(test_frames) if test_frames else 0} test images")
     else:
-        # Default: every 8th frame for testing
         if eval_mode:
             training_frames = [c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
             test_frames = [c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
@@ -328,13 +319,11 @@ def _initialize_gaussians(init_xyz, init_color, sh_degree, cluster_size):
         init_xyz, init_color, sh_degree
     )
     
-    # Optional clustering for memory efficiency
     if cluster_size:
         xyz, scale, rot, sh_0, sh_rest, opacity = scene.cluster.cluster_points(
             cluster_size, xyz, scale, rot, sh_0, sh_rest, opacity
         )
     
-    # Convert to learnable parameters
     return (
         torch.nn.Parameter(xyz),
         torch.nn.Parameter(scale),
@@ -356,7 +345,6 @@ def _compute_cluster_aabb(xyz, scale, rot, cluster_size):
 
 def _initialize_learnable_cameras(trainingset):
     """Initialize learnable camera pose and intrinsic parameters."""
-    # Camera poses (rotation + translation)
     view_params = [
         np.concatenate([frame.qvec, frame.tvec])[None, :]
         for frame in trainingset.frames
@@ -369,12 +357,10 @@ def _initialize_learnable_cameras(trainingset):
         _weight=view_params, sparse=True
     )
     
-    # Camera focal length
     camera_focal_params = torch.nn.Parameter(
         torch.tensor(trainingset.cameras[0].focal_x, dtype=torch.float32, device='cuda')
     )
     
-    # Optimizers
     view_opt = torch.optim.SparseAdam(view_params.parameters(), lr=1e-4)
     proj_opt = torch.optim.Adam([camera_focal_params], lr=1e-5)
     
@@ -396,7 +382,6 @@ def _update_camera_matrices(view_params, camera_focal_params, idx,
     view_matrix[:, :3, :3] = rot_matrix.permute(2, 0, 1)
     view_matrix[:, 3, :3] = tvec
     
-    # Update focal length in projection matrix
     focal_x = camera_focal_params
     focal_y = camera_focal_params * gt_shape[3] / gt_shape[2]
     proj_matrix[:, 0, 0] = focal_x
@@ -420,7 +405,6 @@ def _save_timeout_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
     save_path = os.path.join(lp.model_path, "point_cloud", f"timeout_epoch_{epoch}")
     os.makedirs(save_path, exist_ok=True)
     
-    # Save metrics
     metrics = {
         "time": elapsed_time,
         "model_path": lp.model_path,
@@ -432,14 +416,11 @@ def _save_timeout_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
     with open(os.path.join(save_path, "training_metrics.json"), 'w') as f:
         json.dump(metrics, f, indent=4)
     
-    # Save resolution schedule
     with open(os.path.join(save_path, "res_scale.json"), 'w') as f:
         json.dump(res_scale_buffer, f, indent=4)
     
-    # Save point cloud
     _save_point_cloud(save_path, pp, xyz, scale, rot, sh_0, sh_rest, opacity)
     
-    # Save learnable camera parameters
     if op.learnable_viewproj:
         torch.save(
             list(view_params.parameters()) + [camera_focal_params],
@@ -463,7 +444,6 @@ def _save_model_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
     
     os.makedirs(save_path, exist_ok=True)
     
-    # Save metrics
     metrics = {
         "time": elapsed_time,
         "model_path": lp.model_path,
@@ -475,14 +455,11 @@ def _save_model_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
     with open(os.path.join(save_path, "training_metrics.json"), 'w') as f:
         json.dump(metrics, f, indent=4)
     
-    # Save resolution schedule
     with open(os.path.join(save_path, "res_scale.json"), 'w') as f:
         json.dump(res_scale_buffer, f, indent=4)
     
-    # Save point cloud
     _save_point_cloud(save_path, pp, xyz, scale, rot, sh_0, sh_rest, opacity)
     
-    # Save learnable camera parameters
     if op.learnable_viewproj:
         torch.save(
             list(view_params.parameters()) + [camera_focal_params],
@@ -528,14 +505,12 @@ def _run_evaluation(epoch, train_loader, test_loader, lp, op, pp,
                 frustumplane = frustumplane.cuda()
                 gt_image = gt_image.cuda() / 255.0
                 
-                # Update camera matrices for training set
                 if name == "Trainingset" and op.learnable_viewproj:
                     view_matrix, proj_matrix = _update_camera_matrices(
                         view_params, camera_focal_params, idx,
                         view_matrix, proj_matrix, gt_image.shape
                     )
                 
-                # Render
                 _, culled_xyz, culled_scale, culled_rot, culled_sh_0, \
                 culled_sh_rest, culled_opacity = render.render_preprocess(
                     _cluster_origin, _cluster_extend, frustumplane,

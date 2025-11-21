@@ -46,9 +46,9 @@ class DensityControllerBase:
                 stored_state["exp_avg"].data=torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=cat_dim).contiguous()
                 stored_state["exp_avg_sq"].data=torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=cat_dim).contiguous()
             new_param=torch.cat((group["params"][0], extension_tensor), dim=cat_dim).contiguous()
-            optimizer.state.pop(group['params'][0])#pop param
+            optimizer.state.pop(group['params'][0])
             group["params"][0]=torch.nn.Parameter(new_param)
-            optimizer.state[group["params"][0]]=stored_state#assign to new param
+            optimizer.state[group["params"][0]]=stored_state
             assert stored_state["exp_avg"].shape == stored_state["exp_avg_sq"].shape and stored_state["exp_avg"].shape==group["params"][0].shape
         return
     
@@ -61,7 +61,6 @@ class DensityControllerBase:
                 stored_state = optimizer.state.get(group['params'][0], None)
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
                 stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-                #stored_state["step"]=0#bugfix
 
                 del optimizer.state[group['params'][0]]
                 group["params"][0] = torch.nn.Parameter(tensor.requires_grad_(True))
@@ -92,9 +91,9 @@ class DensityControllerBase:
                 new_param,=cluster.cluster_points(chunk_size,uncluster_param)
             else:
                 new_param=group["params"][0][...,valid_mask]
-            optimizer.state.pop(group['params'][0])#pop param
+            optimizer.state.pop(group['params'][0])
             group["params"][0]=torch.nn.Parameter(new_param)
-            optimizer.state[group["params"][0]]=stored_state#assign to new param
+            optimizer.state[group["params"][0]]=stored_state
         return
     
 class DensityControllerOfficial(DensityControllerBase):
@@ -144,7 +143,7 @@ class DensityControllerOfficial(DensityControllerBase):
 
         prune_mask=self.get_prune_mask(opacity.sigmoid(),scale.exp())
         if prune_mask.sum()>0.8*opacity.shape[1]:
-            assert(False) #debug
+            assert(False)
         if self.bCluster:
             N=prune_mask.sum()
             chunk_num=int(N/chunk_size)
@@ -152,7 +151,6 @@ class DensityControllerOfficial(DensityControllerBase):
             del_indices=prune_mask.nonzero()[:del_limit,0]
             prune_mask=torch.zeros_like(prune_mask)
             prune_mask[del_indices]=True
-        #print("\n #prune:{0} #points:{1}".format(prune_mask.sum(),(~prune_mask).sum()))
         self._prune_optimizer(~prune_mask,optimizer)
         return
 
@@ -216,9 +214,8 @@ class DensityControllerOfficial(DensityControllerBase):
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
         
-        #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_mask.sum().cpu(),split_mask.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
+        return 0
     
     @torch.no_grad()
     def reset_opacity(self,optimizer:torch.optim.Optimizer,epoch:int):
@@ -238,16 +235,16 @@ class DensityControllerOfficial(DensityControllerBase):
     
     @torch.no_grad()
     def is_densify_actived(self,epoch:int):
-
         return epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from and (
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
     def step(self,optimizer:torch.optim.Optimizer,epoch:int):
+        num_added = 0
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
-                self.split_and_clone(optimizer,epoch)
+                num_added = self.split_and_clone(optimizer,epoch)
                 self.prune(optimizer,epoch)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -257,15 +254,15 @@ class DensityControllerOfficial(DensityControllerBase):
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
                 StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
-        return self._get_params_from_optimizer(optimizer)
+        return self._get_params_from_optimizer(optimizer), num_added
     
 
 class DensityControllerTamingGS(DensityControllerOfficial):
     @torch.no_grad()
-    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool,init_points_num:int)->None:
-
+    def __init__(self,screen_extent:int,densify_params:DensifyParams,bCluster:bool,init_points_num:int,scheduler=None)->None:
         assert(densify_params.target_primitives!=0.0)
         self.target_points_num=densify_params.target_primitives
+        self.scheduler = scheduler
         super(DensityControllerTamingGS,self).__init__(screen_extent,densify_params,bCluster,init_points_num)
         return
     
@@ -276,7 +273,7 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
             frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')
             weight_sum=(frag_weight*frag_count).nan_to_num(0).squeeze()
-            invisible = weight_sum==0#weight_sum<(weight_sum[weight_sum!=0].quantile(0.05))
+            invisible = weight_sum==0
             prune_mask[:invisible.shape[0]]|=invisible
         elif self.densify_params.prune_mode == 'threshold':
             prune_mask=super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale)
@@ -285,7 +282,6 @@ class DensityControllerTamingGS(DensityControllerOfficial):
     
     def get_score(self,xyz,scale,rot,sh_0,sh_rest,opacity)->torch.Tensor:
         var,frag_count=StatisticsHelperInst.get_var('fragment_err')
-        #score=(var*frag_count).sqrt()*(opacity.sigmoid())
         score=var*frag_count*(opacity.sigmoid()*opacity.sigmoid())
         score=score.squeeze().nan_to_num(0)
         score.clamp_min_(0)
@@ -293,7 +289,6 @@ class DensityControllerTamingGS(DensityControllerOfficial):
     
     @torch.no_grad()
     def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
-        
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
             chunk_size=xyz.shape[-1]
@@ -301,11 +296,37 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
         prune_num=self.get_prune_mask(opacity.sigmoid(),scale.exp()).sum()
 
-        cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
-        budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
+        # Momentum-based primitive budgeting: use scheduler's dynamic P_fin if available
+        if self.scheduler is not None and self.scheduler.momentum != -1:
+            # Dynamic mode: momentum-based P_fin
+            target_count = self.scheduler.max_n_gaussian
+        else:
+            # Fixed mode: linear interpolation to static target
+            target_count = (self.target_points_num - self.init_points_num) / (
+                self.densify_params.densify_until - self.densify_params.densify_from
+            ) * (epoch - self.densify_params.densify_from) + self.init_points_num
+
+        budget=min(max(int(target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
-        densify_index = torch.multinomial(score, budget, replacement=False)
+        
+        # Handle edge cases
+        if score.sum() <= 0:
+            print(f"[WARNING] Zero score sum at epoch {epoch}, skipping densification")
+            return 0
+        
+        if budget > score.shape[0]:
+            budget = score.shape[0]
+        
+        if budget <= 0:
+            return 0
+        
+        try:
+            densify_index = torch.multinomial(score, budget, replacement=False)
+        except RuntimeError as e:
+            print(f"[ERROR] Multinomial sampling failed: {e}")
+            return 0
+            
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
 
@@ -357,8 +378,12 @@ class DensityControllerTamingGS(DensityControllerOfficial):
                       "sh_0": append_sh_0,
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
-        
-        #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_index.sum().cpu(),split_index.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
+
+        # Calculate number of primitives added (P_add for momentum update)
+        if self.bCluster:
+            num_added = append_xyz.shape[-1] * append_xyz.shape[-2]
+        else:
+            num_added = append_xyz.shape[-1]
+
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
-        return
-    
+        return num_added

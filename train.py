@@ -42,8 +42,8 @@ def train(args):
     # Base training config (without --images which varies per scene)
     train_config_base = (
         "--sh_degree 3 --source_type colmap "
-        "--target_primitives 1000000 --iterations 10000 "
-        "--position_lr_max_steps 10000 --position_lr_final 0.000016 "
+        "--target_primitives 1000000 --iterations 6000 "
+        "--position_lr_max_steps 6000 --position_lr_final 0.000016 "
         "--densification_interval 2 "
         "--resolution_mode freq"
     )
@@ -57,7 +57,7 @@ def train(args):
         print(f"\n[{i+1}/{len(scene_folders)}] Training: {scene_name} (using {image_dir})")
 
         train_cmd = (
-            f"CUDA_VISIBLE_DEVICES={args.gpu} CUDA_LAUNCH_BLOCKING=1 python example_train.py "
+            f"CUDA_VISIBLE_DEVICES={args.gpu} python example_train.py "
             f"-s {source_path} -m {model_path} {train_config_base} --images {image_dir}"
         )
         print(train_cmd)
