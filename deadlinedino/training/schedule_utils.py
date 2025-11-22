@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import math
 import torch
-from .. import arguments
+from typing import List
 
 class TrainingScheduler():
 	"""
-	DashGaussian training scheduler of resolution and primitive number.
-	Implements momentum-based primitive budgeting.
+	Hybrid training scheduler: DashGaussian momentum → LiteGS fixed target
+	
+	Strategy:
+	- Phase 1 (scale > 1): Momentum-based adaptive growth (DashGaussian)
+	- Phase 2 (scale = 1): Fixed linear target (LiteGS)
 	"""
-	def __init__(self, opt: arguments.OptimizationParams, dens: arguments.DensifyParams, pipe: arguments.PipelineParams, init_n_gaussian: int, original_images: list) -> None:
+	def __init__(self, opt, dens, pipe, init_n_gaussian: int, original_images: List) -> None:
 
 		self.max_steps = opt.iterations
 		self.init_n_gaussian = init_n_gaussian
@@ -21,7 +24,7 @@ class TrainingScheduler():
 		self.resolution_mode = pipe.resolution_mode
 
 		self.start_significance_factor = 4
-		self.max_reso_scale = 5
+		self.max_reso_scale = 8
 		self.reso_sample_num = 32
 		self.max_densify_rate_per_step = 0.2
 		self.reso_scales = None
@@ -30,90 +33,81 @@ class TrainingScheduler():
 		self.increase_reso_until = self.densify_until_iter
 		self.next_i = 2
 
-		# Momentum-based primitive budgeting (DashGaussian Eq. 5)
-		# γ = 0.98, η = 1.0 (defaults from paper)
-		self.integrate_factor = 0.98
-		self.momentum_step_cap = 1000000
+		# === HYBRID BUDGETING PARAMETERS ===
+		self.budgeting_mode = "hybrid"  # "momentum" or "fixed" or "hybrid"
 		
+		# Phase 1: Momentum-based (DashGaussian)
+		self.momentum = 5 * init_n_gaussian  # Start with 5x initial
+		self.max_n_gaussian = self.init_n_gaussian + self.momentum
+		self.integrate_factor = 0.98  # γ in Eq.5
+		self.eta = 1.0  # η in Eq.5
+		self.momentum_step_cap = 1000000  # Cap per-step addition
+		
+		# Phase 2: Fixed target (LiteGS)
+		self.fixed_target = None  # Will be set when transitioning
+		self.transition_iteration = None  # When we hit scale=1
+		self.has_transitioned = False
+		
+		# If user explicitly sets target, use fixed mode throughout
 		if pipe.max_n_gaussian > 0:
-			# Fixed mode: target is specified
-			self.max_n_gaussian = pipe.max_n_gaussian
-			self.momentum = -1  # Disable momentum
-			print(f"[SCHEDULER] Fixed mode: target={self.max_n_gaussian} primitives")
+			self.budgeting_mode = "fixed"
+			self.fixed_target = pipe.max_n_gaussian
+			self.momentum = -1
+			print(f"[SCHEDULER] Fixed mode: target={self.fixed_target} primitives")
 		else:
-			# Dynamic mode: organic growth targeting 1-2 million
-			# Start with modest initial momentum for organic growth
-			self.momentum = 2 * self.init_n_gaussian  # Reduced initial momentum
-			self.max_n_gaussian = self.init_n_gaussian + self.momentum
-			print(f"[SCHEDULER] Organic growth mode: P_fin_init={self.max_n_gaussian} (init={self.init_n_gaussian}, momentum={self.momentum}), γ={self.integrate_factor}")
-		print(f"[SCHEDULER] Target range: 1-2 million primitives (organic)")
+			print(f"[SCHEDULER] Hybrid mode: momentum → fixed at full resolution")
+			print(f"[SCHEDULER] Initial Pfin={self.max_n_gaussian} (5x init)")
+		
 		# Generate schedulers
 		self.init_reso_scheduler(original_images)
-	
-	def update_momentum(self, momentum_step, current_iteration=None, current_scale=None):
+
+	def update_momentum(self, momentum_step):
 		"""
-		Update momentum-based primitive budget to organically reach 1-2 million.
+		Update momentum using DashGaussian Eq.5: Pfin = max(Pfin, γ·Pfin + η·Padd)
+		
+		Only applies during Phase 1 (progressive resolution).
 		"""
-		if self.momentum == -1:
-			# Fixed mode: no momentum update
+		# Skip if in fixed mode or already transitioned
+		if self.momentum == -1 or self.has_transitioned:
 			return
 		
-		# Apply cap to prevent explosive growth from single densification
-		capped_step = min(self.momentum_step_cap, momentum_step)
+		if momentum_step is None or momentum_step == 0:
+			return
 		
-		# Adaptive η that naturally slows down as we approach target range
-		current_total = self.init_n_gaussian + self.momentum
-		
-		# Progress-based η reduction - becomes more conservative as we grow
-		if current_total < 500000:
-			# Early stage: moderate growth to reach 500K
-			base_eta = 0.6
-		elif current_total < 1000000:
-			# Mid stage: slower growth to reach 1M
-			base_eta = 0.4
-		elif current_total < 1500000:
-			# Late stage: very slow growth to approach 1.5M
-			base_eta = 0.2
-		else:
-			# Final stage: minimal growth beyond 1.5M
-			base_eta = 0.1
-		
-		# Scale-based adjustment
-		if current_scale is not None and current_scale > 1:
-			scale_factor = max(1.0, self.max_reso_scale / current_scale)
-			eta = base_eta * (scale_factor ** 0.3)  # Very gentle scale dependence
-			eta = min(eta, base_eta * 1.5)  # Limited boost from scale
-		else:
-			eta = base_eta
-		
-		# Time-based damping - become more conservative over iterations
-		if current_iteration is not None:
-			progress = min(current_iteration / self.densify_until_iter, 1.0)
-			time_damping = 1.0 - (progress * 0.6)  # Reduce η by up to 60% over time
-			eta *= time_damping
-		
-		# Size-based damping - natural slowdown as we grow larger
-		size_damping = max(0.3, 1.0 - (current_total / 2000000))  # Dampens to 30% at 2M
-		eta *= size_damping
-		
-		# DashGaussian Eq. 5 with multi-factor adaptive η
-		old_momentum = self.momentum
-		new_momentum = int(self.integrate_factor * self.momentum + eta * capped_step)
-		self.momentum = max(self.momentum, new_momentum)
-		
-		# Update max_n_gaussian (P_fin)
-		old_max = self.max_n_gaussian
+		# DashGaussian Eq.5 with capping
+		capped_add = min(self.momentum_step_cap, momentum_step)
+		new_momentum = self.integrate_factor * self.momentum + self.eta * capped_add
+		self.momentum = max(self.momentum, int(new_momentum))
 		self.max_n_gaussian = self.init_n_gaussian + self.momentum
 		
-		if momentum_step > 0:
-			eta_str = f", η={eta:.3f}" if current_scale is not None else ""
-			scale_str = f", scale={current_scale:.0f}" if current_scale is not None else ""
-			progress_str = f", progress={progress:.2f}" if current_iteration is not None else ""
-			current_str = f", current={current_total}"
-			print(f"[MOMENTUM] P_add={momentum_step}{eta_str}{scale_str}{progress_str}{current_str}, P_fin: {old_max} -> {self.max_n_gaussian} (+{self.max_n_gaussian - old_max})")
-			
+		print(f"[MOMENTUM] Phase 1: Pfin={self.max_n_gaussian:.0f} "
+		      f"(momentum={self.momentum:.0f}, added={momentum_step})")
+
+	def transition_to_fixed_target(self, current_iteration, current_n_primitives):
+		"""
+		Transition from momentum-based to fixed-target mode at full resolution.
+		
+		Captures current primitive count as the target and switches to linear growth.
+		"""
+		if self.has_transitioned:
+			return
+		
+		self.has_transitioned = True
+		self.transition_iteration = current_iteration
+		
+		# Use current momentum estimate as fixed target
+		self.fixed_target = self.max_n_gaussian
+		
+		print(f"\n{'='*60}")
+		print(f"[TRANSITION] Reached full resolution (scale=1)")
+		print(f"[TRANSITION] Switching from momentum → fixed target")
+		print(f"[TRANSITION] Captured target: {self.fixed_target:.0f} primitives")
+		print(f"[TRANSITION] Current count: {current_n_primitives}")
+		print(f"[TRANSITION] Remaining iterations: {self.densify_until_iter - current_iteration}")
+		print(f"{'='*60}\n")
+
 	def get_res_scale(self, iteration):
-		"""Get current resolution scale based on iteration."""
+		"""Get current resolution scale."""
 		if self.resolution_mode == "const":
 			return 1
 		elif self.resolution_mode == "freq":
@@ -132,71 +126,79 @@ class TrainingScheduler():
 			raise NotImplementedError(f"Resolution mode '{self.resolution_mode}' not implemented")
 	
 	def get_densify_rate(self, iteration, cur_n_gaussian, cur_scale=None):
-		"""Calculate densification rate for organic 1-2M growth."""
+		"""
+		Compute densification rate using hybrid strategy:
+		- Phase 1 (scale > 1): DashGaussian momentum-based
+		- Phase 2 (scale = 1): LiteGS fixed linear target
+		"""
 		if self.densify_mode == "free":
-			# Progressive reduction based on current size
-			if cur_n_gaussian < 500000:
-				return 0.4
-			elif cur_n_gaussian < 1000000:
-				return 0.2
-			elif cur_n_gaussian < 1500000:
-				return 0.1
-			else:
-				return 0.05
+			return 1.0
+		
 		elif self.densify_mode == "freq":
 			assert cur_scale is not None, "cur_scale required for freq mode"
 			
-			progress = min(iteration / self.densify_until_iter, 1.0)
+			# Check if we've reached full resolution
+			if cur_scale == 1 and not self.has_transitioned:
+				self.transition_to_fixed_target(iteration, cur_n_gaussian)
 			
-			# Adaptive power factor based on current size
-			if cur_n_gaussian < 500000:
-				power_factor = 2.0 - progress  # Standard growth
-			elif cur_n_gaussian < 1000000:
-				power_factor = 2.3 - progress  # Slower growth
+			# === PHASE 2: Fixed Linear Target (LiteGS style) ===
+			if self.has_transitioned:
+				# Linear interpolation from current to target
+				remaining_iters = self.densify_until_iter - iteration
+				if remaining_iters <= 0:
+					return 0.0
+				
+				# Calculate how many steps remain
+				remaining_steps = max(1, remaining_iters // self.densification_interval)
+				
+				# Linear growth to target
+				total_to_add = max(0, self.fixed_target - cur_n_gaussian)
+				per_step_add = total_to_add / remaining_steps
+				densify_rate = per_step_add / self.init_n_gaussian
+				
+				if iteration % 100 == 0:
+					print(f"[DENSIFY] Phase 2 (Fixed): iter={iteration}, "
+					      f"current={cur_n_gaussian}, target={self.fixed_target:.0f}, "
+					      f"to_add={total_to_add:.0f}, rate={densify_rate:.3f}")
+			
+			# === PHASE 1: Momentum-Based (DashGaussian style) ===
 			else:
-				power_factor = 2.8 - progress  # Very slow growth
+				# DashGaussian Eq.4 with power factor decay
+				progress = iteration / self.densify_until_iter
+				power_factor = 2.0 - progress  # 2.0 → 1.0
+				
+				denominator = cur_scale ** power_factor
+				target_n_primitives = self.init_n_gaussian + \
+				                     (self.max_n_gaussian - self.init_n_gaussian) / denominator
+				
+				# Smooth growth over remaining steps
+				remaining_iters = self.increase_reso_until - iteration
+				if remaining_iters <= 0:
+					return 0.0
+				
+				remaining_steps = max(1, remaining_iters // self.densification_interval)
+				total_to_add = max(0, target_n_primitives - cur_n_gaussian)
+				per_step_add = total_to_add / remaining_steps
+				densify_rate = per_step_add / self.init_n_gaussian
+				
+				if iteration % 100 == 0:
+					print(f"[DENSIFY] Phase 1 (Momentum): iter={iteration}, scale={cur_scale}, "
+					      f"power={power_factor:.2f}, target={target_n_primitives:.0f}, "
+					      f"current={cur_n_gaussian}, rate={densify_rate:.3f}")
 			
-			# Target primitive count
-			denominator = cur_scale ** power_factor
-			target_n_gaussian = self.init_n_gaussian + (self.max_n_gaussian - self.init_n_gaussian) / denominator
-			
-			# Calculate remaining densification steps
-			remaining_iters = self.densify_until_iter - iteration
-			if remaining_iters <= 0:
-				return 0.0
-			
-			remaining_steps = max(1, remaining_iters // self.densification_interval)
-			
-			# Conservative growth per step with size-based limiting
-			total_to_add = max(0, target_n_gaussian - cur_n_gaussian)
-			
-			# Size-based step limiting
-			max_step_size = min(50000, cur_n_gaussian * 0.1)  # Never add more than 10% of current size
-			total_to_add = min(total_to_add, max_step_size)
-			
-			per_step_add = total_to_add / remaining_steps
-			
-			# Convert to rate
-			densify_rate = per_step_add / self.init_n_gaussian
-			
-			# Adaptive clamp based on current size
-			if cur_n_gaussian < 500000:
-				max_rate = self.max_densify_rate_per_step * 0.5
-			elif cur_n_gaussian < 1000000:
-				max_rate = self.max_densify_rate_per_step * 0.3
-			else:
-				max_rate = self.max_densify_rate_per_step * 0.15
-			
-			densify_rate = max(0, min(densify_rate, max_rate))
-			
+			# Clamp to prevent explosive growth
+			densify_rate = max(0, min(densify_rate, self.max_densify_rate_per_step))
 			return densify_rate
+		
+		else:
+			raise NotImplementedError(f"Densify mode '{self.densify_mode}' not implemented")
 	
 	def lr_decay_from_iter(self):
-		"""Determine when learning rate decay should start."""
+		"""Determine when to start LR decay."""
 		if self.resolution_mode == "const":
 			return 1
 		
-		# Start decay when resolution scale drops below 2
+		# Start decay when scale drops below 2
 		for i, s in zip(self.reso_level_begin, self.reso_scales):
 			if s < 2:
 				return i
@@ -204,9 +206,9 @@ class TrainingScheduler():
 		return self.increase_reso_until
 
 	def init_reso_scheduler(self, original_images):
-		"""Initialize frequency-based resolution scheduler using FFT analysis."""
+		"""Initialize frequency-based resolution scheduler."""
 		if self.resolution_mode != "freq":
-			print(f"[INFO] Skipped resolution scheduler init, mode is {self.resolution_mode}")
+			print(f"[ INFO ] Skipped resolution scheduler, mode is {self.resolution_mode}")
 			return
 
 		def compute_win_significance(significance_map: torch.Tensor, scale: float):
@@ -238,7 +240,7 @@ class TrainingScheduler():
 					R = mid
 			return 1 / max(L, 1e-9)
 		
-		print("[INFO] Initializing resolution scheduler...")
+		print("[ INFO ] Initializing resolution scheduler...")
 
 		self.max_reso_scale = 8
 		self.next_i = 2
@@ -248,7 +250,7 @@ class TrainingScheduler():
 			if img_tensor.dim() == 4:
 				img_tensor = img_tensor.squeeze(0)
 			if img_tensor.dim() != 3:
-				raise ValueError(f"Image tensor has wrong dimensions: {img_tensor.shape}")
+				raise ValueError(f"Image tensor wrong dimensions: {img_tensor.shape}")
 			
 			img_tensor = img_tensor.float()
 			
@@ -286,11 +288,10 @@ class TrainingScheduler():
 		self.reso_level_begin.append(0)
 		
 		denom = modulation_func(E_total / E_min)
-		if denom == 0:
-			denom = 1e-9
+		if denom == 0: denom = 1e-9
 
 		for i in range(1, self.reso_sample_num - 1):
-			self.reso_level_significance.append((E_total - E_min) * (i - 0) / (self.reso_sample_num-1 - 0) + E_min)
+			self.reso_level_significance.append((E_total - E_min) * i / (self.reso_sample_num - 1) + E_min)
 			self.reso_scales.append(scale_solver(scene_freq_image, self.reso_level_significance[-1]))
 			self.reso_level_significance[-2] = modulation_func(self.reso_level_significance[-2] / E_min)
 			self.reso_level_begin.append(int(self.increase_reso_until * self.reso_level_significance[-2] / denom))
@@ -301,4 +302,5 @@ class TrainingScheduler():
 		self.reso_level_begin.append(int(self.increase_reso_until * self.reso_level_significance[-2] / denom))
 		self.reso_level_begin.append(self.increase_reso_until)
 
-		print(f"[INFO] Resolution scheduler: {len(self.reso_scales)} levels, max_scale={self.max_reso_scale:.2f}")
+		print(f"[ INFO ] Resolution scheduler initialized with {len(self.reso_scales)} levels")
+		print(f"[ INFO ] Scale range: {self.max_reso_scale:.1f} → 1.0")
