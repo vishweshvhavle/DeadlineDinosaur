@@ -168,18 +168,21 @@ class DensityControllerOfficial(DensityControllerBase):
             from ..scene import cluster
         except:
             from scene import cluster
-            
+
         xyz, scale, rot, sh_0, sh_rest, opacity = self._get_params_from_optimizer(optimizer)
         if self.bCluster:
             chunk_size = xyz.shape[-1]
+            before_count = xyz.shape[-2] * xyz.shape[-1]
             xyz, scale, rot, sh_0, sh_rest, opacity = cluster.uncluster(
                 xyz, scale, rot, sh_0, sh_rest, opacity
             )
+        else:
+            before_count = xyz.shape[-1]
 
         prune_mask = self.get_prune_mask(opacity.sigmoid(), scale.exp())
         if prune_mask.sum() > 0.8 * opacity.shape[1]:
             assert False, "Pruning too many primitives!"
-        
+
         if self.bCluster:
             N = prune_mask.sum()
             chunk_num = int(N / chunk_size)
@@ -187,8 +190,19 @@ class DensityControllerOfficial(DensityControllerBase):
             del_indices = prune_mask.nonzero()[:del_limit, 0]
             prune_mask = torch.zeros_like(prune_mask)
             prune_mask[del_indices] = True
-        
+
+        pruned_count = prune_mask.sum().item()
         self._prune_optimizer(~prune_mask, optimizer)
+
+        # Get count after pruning
+        xyz_after, _, _, _, _, _ = self._get_params_from_optimizer(optimizer)
+        if self.bCluster:
+            after_count = xyz_after.shape[-2] * xyz_after.shape[-1]
+        else:
+            after_count = xyz_after.shape[-1]
+
+        # Debug output
+        print(f"[PRUNE][Epoch {epoch}] before={before_count}, pruned={int(pruned_count)}, after={after_count}")
         return
 
     @torch.no_grad()
@@ -296,15 +310,26 @@ class DensityControllerOfficial(DensityControllerBase):
                (epoch % self.densify_params.densification_interval == 0)
 
     @torch.no_grad()
-    def step(self, optimizer: torch.optim.Optimizer, epoch: int, scheduler=None, 
+    def step(self, optimizer: torch.optim.Optimizer, epoch: int, scheduler=None,
              current_iteration=None, current_n_primitives=None, current_render_scale=None):
         try:
             from ..utils.statistic_helper import StatisticsHelperInst
         except:
             from utils.statistic_helper import StatisticsHelperInst
-            
+
+        # Store initial stats for debug output
+        xyz, scale, rot, sh_0, sh_rest, opacity = self._get_params_from_optimizer(optimizer)
+        if self.bCluster:
+            before_count = xyz.shape[-2] * xyz.shape[-1]
+        else:
+            before_count = xyz.shape[-1]
+        before_opacity = opacity.sigmoid().mean().item()
+        before_scale = scale.exp().mean().item()
+
         if epoch < self.densify_params.densify_until and epoch >= self.densify_params.densify_from:
             bUpdate = False
+            densification_happened = False
+
             if epoch % self.densify_params.densification_interval == 0:
                 # Get densify rate from scheduler if available
                 densify_rate = None
@@ -313,26 +338,46 @@ class DensityControllerOfficial(DensityControllerBase):
                     densify_rate = scheduler.get_densify_rate(
                         current_iteration, current_n_primitives, current_render_scale
                     )
-                
+
                 # Perform densification
                 momentum_add = self.split_and_clone(optimizer, epoch, densify_rate)
-                
+
                 # Update momentum (Phase 1 only)
                 if scheduler is not None and momentum_add is not None:
                     scheduler.update_momentum(momentum_add)
-                
+
                 self.prune(optimizer, epoch)
                 bUpdate = True
-            
+                densification_happened = True
+
             if epoch % self.densify_params.opacity_reset_interval == 0:
                 self.reset_opacity(optimizer, epoch)
                 bUpdate = True
-            
+
             if bUpdate:
                 xyz, scale, rot, sh_0, sh_rest, opacity = self._get_params_from_optimizer(optimizer)
                 StatisticsHelperInst.reset(xyz.shape[-2], xyz.shape[-1], self.is_densify_actived)
                 torch.cuda.empty_cache()
-        
+
+                # Get stats after densification
+                if self.bCluster:
+                    after_count = xyz.shape[-2] * xyz.shape[-1]
+                else:
+                    after_count = xyz.shape[-1]
+                after_opacity = opacity.sigmoid().mean().item()
+                after_scale = scale.exp().mean().item()
+
+                if densification_happened:
+                    delta = after_count - before_count
+                    print(f"[DENSIFY][Epoch {epoch}] Gaussians: {before_count} -> {after_count} "
+                          f"(Δ = {delta:+d}), mean_opacity: {before_opacity:.6f} -> {after_opacity:.6f}, "
+                          f"mean_scale: {before_scale:.6f} -> {after_scale:.6f}")
+            else:
+                # Active window but no densification step
+                print(f"[DENSIFY][Epoch {epoch}] active window but no densification step. "
+                      f"Gaussians: {before_count}, mean_opacity: {before_opacity:.6f}, "
+                      f"mean_scale: {before_scale:.6f}")
+
         return self._get_params_from_optimizer(optimizer)
 
 
@@ -413,19 +458,20 @@ class DensityControllerTamingGS(DensityControllerOfficial):
                 xyz, scale, rot, sh_0, sh_rest, opacity
             )
 
-        prune_num = self.get_prune_mask(opacity.sigmoid(), scale.exp()).sum()
-        
+        before_count = xyz.shape[-1]
+        prune_num = self.get_prune_mask(opacity.sigmoid(), scale.exp()).sum().item()
+
         # === BUDGET CALCULATION ===
         if densify_rate is not None:
             # Use scheduler's rate (hybrid mode)
             target_add = int(densify_rate * self.init_points_num)
-            budget = min(max(target_add + prune_num, 1), xyz.shape[-1])
+            budget = min(max(target_add + int(prune_num), 1), xyz.shape[-1])
         else:
             # Fallback: original TamingGS linear growth
             cur_target_count = (self.target_points_num - self.init_points_num) / \
                               (self.densify_params.densify_until - self.densify_params.densify_from) * \
                               (epoch - self.densify_params.densify_from) + self.init_points_num
-            budget = min(max(int(cur_target_count - xyz.shape[-1]), 1) + prune_num, xyz.shape[-1])
+            budget = min(max(int(cur_target_count - xyz.shape[-1]), 1) + int(prune_num), xyz.shape[-1])
 
         # Score-based multinomial sampling (TamingGS)
         score = self.get_score(xyz, scale, rot, sh_0, sh_rest, opacity)
@@ -486,6 +532,17 @@ class DensityControllerTamingGS(DensityControllerOfficial):
                     append_sh_rest[..., :append_limit], append_opacity[..., :append_limit]
                 )
 
+        # Calculate counts for debug output
+        added_count = append_xyz.shape[-1] if not self.bCluster else append_xyz.shape[-2]
+        after_count = before_count + added_count
+        split_count = split_index.shape[0]
+        clone_count = clone_index.shape[0]
+
+        # Debug output
+        print(f"[TAMING-GS][Epoch {epoch}] target={self.target_points_num}, budget={budget}, "
+              f"before={before_count}, added={added_count}, after={after_count}, "
+              f"prune_num={int(prune_num)}, split={split_count}, clone={clone_count}")
+
         dict_clone = {
             "xyz": append_xyz,
             "scale": append_scale,
@@ -494,9 +551,8 @@ class DensityControllerTamingGS(DensityControllerOfficial):
             "sh_rest": append_sh_rest,
             "opacity": append_opacity
         }
-        
+
         self._cat_tensors_to_optimizer(dict_clone, optimizer)
-        
+
         # Return naturally added count for momentum tracking
-        added_count = append_xyz.shape[-1] if not self.bCluster else append_xyz.shape[-2]
         return added_count
