@@ -42,7 +42,7 @@ def train(args):
     # Base training config (without --images which varies per scene)
     train_config_base = (
         "--sh_degree 3 --source_type colmap "
-        "--target_primitives 1000000 --iterations 6500 "
+        "--target_primitives 2000000 --iterations 6500 "
         "--position_lr_max_steps 6500 --position_lr_final 0.000016 "
         "--densification_interval 2 "
         "--resolution_mode freq"

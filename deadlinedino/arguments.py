@@ -80,7 +80,7 @@ class PipelineParams(ParamGroup):
     
     # --- ADDED THESE ---
     densify_mode = "free"
-    max_n_gaussian = -1
+    max_n_gaussian = 2000000
     # --- END ADD ---
 
     def __init__(self, parser):
@@ -108,7 +108,7 @@ class DensifyParams(ParamGroup):
     opacity_reset_interval = 10
     opacity_reset_mode='decay'#'decay','reset'
     prune_mode='weight'#'weight','threshold'
-    target_primitives=1000000
+    target_primitives=2000000
 
     #discard
     densify_grad_threshold = 0.00015
