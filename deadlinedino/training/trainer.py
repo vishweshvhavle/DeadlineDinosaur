@@ -193,11 +193,6 @@ def start(
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     training_start_time = time.time()
     
-    print(f"[TRAINING] Starting: {init_points_num} primitives, {total_epoch} epochs")
-    print(f"[TRAINING] Densify: epochs {dp.densify_from} → {dp.densify_until}, interval={dp.densification_interval}")
-    if pp.resolution_mode == "freq":
-        print(f"[TRAINING] Progressive resolution: scale {training_scheduler.max_reso_scale} → 1")
-    
     # ========== 7. MAIN TRAINING LOOP ==========
     for epoch in range(start_epoch, total_epoch):
         
@@ -339,7 +334,6 @@ def start(
             io_manager.save_checkpoint(lp.model_path, epoch, opt, schedular)
     
     progress_bar.close()
-    print(f"[TRAINING] Completed in {time.time() - training_start_time:.2f}s")
     return
 
 
@@ -527,9 +521,6 @@ def _save_model_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
             os.path.join(save_path, "viewproj.pth")
         )
     
-    if is_final:
-        print(f"[TRAINING] Completed: {lp.model_path} in {elapsed_time:.2f}s")
-
 
 def _save_point_cloud(save_path, pp, xyz, scale, rot, sh_0, sh_rest, opacity):
     """Save point cloud to PLY."""

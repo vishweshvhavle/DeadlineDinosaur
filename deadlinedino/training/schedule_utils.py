@@ -53,13 +53,7 @@ class TrainingScheduler():
 			self.budgeting_mode = "fixed"
 			self.fixed_target = pipe.max_n_gaussian
 			self.momentum = -1
-			print(f"[SCHEDULER] Fixed mode: target={self.fixed_target} primitives")
-		else:
-			print(f"[SCHEDULER] Hybrid mode: momentum → fixed at full resolution")
-			print(f"[SCHEDULER] Initial Pfin={self.max_n_gaussian} (5x init)")
-		
-		print(f"[SCHEDULER] Densify until iteration: {self.densify_until_iter}")
-		print(f"[SCHEDULER] Resolution mode: {self.resolution_mode}")
+	
 		
 		# Generate schedulers
 		self.init_reso_scheduler(original_images)
@@ -83,8 +77,6 @@ class TrainingScheduler():
 		self.momentum = max(self.momentum, int(new_momentum))
 		self.max_n_gaussian = self.init_n_gaussian + self.momentum
 		
-		print(f"[MOMENTUM] Phase 1: Pfin={self.max_n_gaussian:.0f} "
-		      f"(momentum={self.momentum:.0f}, added={momentum_step})")
 
 	def transition_to_fixed_target(self, current_iteration, current_n_primitives):
 		"""
@@ -101,13 +93,6 @@ class TrainingScheduler():
 		# Use current momentum estimate as fixed target
 		self.fixed_target = self.max_n_gaussian
 		
-		print(f"\n{'='*60}")
-		print(f"[TRANSITION] Reached full resolution (scale=1)")
-		print(f"[TRANSITION] Switching from momentum → fixed target")
-		print(f"[TRANSITION] Captured target: {self.fixed_target:.0f} primitives")
-		print(f"[TRANSITION] Current count: {current_n_primitives}")
-		print(f"[TRANSITION] Remaining iterations: {self.densify_until_iter - current_iteration}")
-		print(f"{'='*60}\n")
 
 	def get_res_scale(self, iteration):
 		"""Get current resolution scale."""
@@ -134,14 +119,12 @@ class TrainingScheduler():
 		- Phase 1 (scale > 1): DashGaussian momentum-based
 		- Phase 2 (scale = 1): LiteGS fixed linear target
 		"""
-		print(f"[DENSIFY] Getting densify rate at iteration {iteration}, Densify Mode: {self.densify_mode}")
+
 		if self.densify_mode == "free":
 			return 1.0
 
 		elif self.densify_mode == "freq":
 			assert cur_scale is not None, "cur_scale required for freq mode"
-
-			print(f"[DENSIFY][Iter {iteration}] Current Scale: {cur_scale}, Current Primitives: {cur_n_gaussian}, Has Transitioned: {self.has_transitioned}")
 
 			# Check if we've reached full resolution
 			if cur_scale == 1 and not self.has_transitioned:
@@ -155,7 +138,6 @@ class TrainingScheduler():
 			else:
 				# Safety check: ensure densify_until_iter is valid
 				if self.densify_until_iter <= 0:
-					print(f"[DENSIFY] WARNING: Invalid densify_until_iter={self.densify_until_iter}, defaulting to no densification")
 					return 0.0
 
 				# DashGaussian Eq.4 with power factor decay
@@ -167,7 +149,6 @@ class TrainingScheduler():
 				# For cur_scale=8, power_factor should be <= ~10
 				max_safe_power = 15.0 if cur_scale <= 4 else 10.0
 				if power_factor > max_safe_power:
-					print(f"[DENSIFY] WARNING: power_factor={power_factor:.2f} too high, clamping to {max_safe_power}")
 					power_factor = max_safe_power
 
 				denominator = cur_scale ** power_factor
@@ -183,11 +164,6 @@ class TrainingScheduler():
 				total_to_add = max(0, target_n_primitives - cur_n_gaussian)
 				per_step_add = total_to_add / remaining_steps
 				densify_rate = per_step_add / self.init_n_gaussian
-				
-				if iteration % 100 == 0:
-					print(f"[DENSIFY] Phase 1 (Momentum): iter={iteration}, scale={cur_scale}, "
-					      f"power={power_factor:.2f}, target={target_n_primitives:.0f}, "
-					      f"current={cur_n_gaussian}, rate={densify_rate:.3f}")
 			
 			# Clamp to prevent explosive growth
 			densify_rate = max(0, min(densify_rate, self.max_densify_rate_per_step))
@@ -211,7 +187,6 @@ class TrainingScheduler():
 	def init_reso_scheduler(self, original_images):
 		"""Initialize frequency-based resolution scheduler."""
 		if self.resolution_mode != "freq":
-			print(f"[ INFO ] Skipped resolution scheduler, mode is {self.resolution_mode}")
 			return
 
 		def compute_win_significance(significance_map: torch.Tensor, scale: float):
@@ -243,7 +218,6 @@ class TrainingScheduler():
 					R = mid
 			return 1 / max(L, 1e-9)
 		
-		print("[ INFO ] Initializing resolution scheduler...")
 
 		self.max_reso_scale = 8
 		self.next_i = 2
@@ -304,6 +278,3 @@ class TrainingScheduler():
 		self.reso_scales.append(1.)
 		self.reso_level_begin.append(int(self.increase_reso_until * self.reso_level_significance[-2] / denom))
 		self.reso_level_begin.append(self.increase_reso_until)
-
-		print(f"[ INFO ] Resolution scheduler initialized with {len(self.reso_scales)} levels")
-		print(f"[ INFO ] Scale range: {self.max_reso_scale:.1f} → 1.0")

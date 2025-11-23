@@ -201,8 +201,6 @@ class DensityControllerOfficial(DensityControllerBase):
         else:
             after_count = xyz_after.shape[-1]
 
-        # Debug output
-        print(f"[PRUNE][Epoch {epoch}] before={before_count}, pruned={int(pruned_count)}, after={after_count}")
         return
 
     @torch.no_grad()
@@ -333,13 +331,13 @@ class DensityControllerOfficial(DensityControllerBase):
             if epoch % self.densify_params.densification_interval == 0:
                 # Get densify rate from scheduler if available
                 densify_rate = None
-                print(f"[DENSIFY][Epoch {epoch}] Densification step triggered. Current Render Scale: {current_render_scale}")
+                
                 if scheduler is not None and current_iteration is not None and \
                    current_n_primitives is not None and current_render_scale is not None:
                     densify_rate = scheduler.get_densify_rate(
                         current_iteration, current_n_primitives, current_render_scale
                     )
-                    print(f"[DENSIFY][Epoch {epoch}] Densify rate from scheduler: {densify_rate}")
+                    
 
                 # Perform densification
                 momentum_add = self.split_and_clone(optimizer, epoch, densify_rate)
@@ -361,24 +359,6 @@ class DensityControllerOfficial(DensityControllerBase):
                 StatisticsHelperInst.reset(xyz.shape[-2], xyz.shape[-1], self.is_densify_actived)
                 torch.cuda.empty_cache()
 
-                # Get stats after densification
-                if self.bCluster:
-                    after_count = xyz.shape[-2] * xyz.shape[-1]
-                else:
-                    after_count = xyz.shape[-1]
-                after_opacity = opacity.sigmoid().mean().item()
-                after_scale = scale.exp().mean().item()
-
-                if densification_happened:
-                    delta = after_count - before_count
-                    print(f"[DENSIFY][Epoch {epoch}] Gaussians: {before_count} -> {after_count} "
-                          f"(Δ = {delta:+d}), mean_opacity: {before_opacity:.6f} -> {after_opacity:.6f}, "
-                          f"mean_scale: {before_scale:.6f} -> {after_scale:.6f}")
-            else:
-                # Active window but no densification step
-                print(f"[DENSIFY][Epoch {epoch}] active window but no densification step. "
-                      f"Gaussians: {before_count}, mean_opacity: {before_opacity:.6f}, "
-                      f"mean_scale: {before_scale:.6f}")
 
         return self._get_params_from_optimizer(optimizer)
 
@@ -540,10 +520,6 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         split_count = split_index.shape[0]
         clone_count = clone_index.shape[0]
 
-        # Debug output
-        print(f"[TAMING-GS][Epoch {epoch}] target={self.target_points_num}, budget={budget}, "
-              f"before={before_count}, added={added_count}, after={after_count}, "
-              f"prune_num={int(prune_num)}, split={split_count}, clone={clone_count}")
 
         dict_clone = {
             "xyz": append_xyz,
