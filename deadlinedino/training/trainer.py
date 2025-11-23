@@ -112,18 +112,28 @@ def start(
         )
     
     norm_trans, norm_radius = trainingset.get_norm()
-    
+
     # ========== 3. SCHEDULER INITIALIZATION ==========
     print("[TRAINING] Initializing hybrid momentum scheduler...")
-    
+
+    # Calculate total epochs for densify parameter initialization
+    total_epoch = int(op.iterations / len(trainingset))
+
+    # Fix densify parameters if not set (must happen BEFORE scheduler init)
+    if dp.densify_until < 0 or dp.densify_until_iter < 0:
+        dp.densify_until = int(
+            total_epoch * 0.8 / dp.opacity_reset_interval
+        ) * dp.opacity_reset_interval + 1
+        dp.densify_until_iter = int(op.iterations * 0.8)
+
     # Prepare images for frequency analysis
     original_images_for_fft = []
     if pp.resolution_mode == "freq":
         for frame in training_frames:
             original_images_for_fft.append(frame.image[lp.resolution])
-    
+
     init_points_num = init_xyz.shape[0]
-    
+
     # Initialize hybrid scheduler (momentum → fixed at full resolution)
     training_scheduler = schedule_utils.TrainingScheduler(
         op, dp, pp, init_points_num, original_images_for_fft
@@ -172,17 +182,10 @@ def start(
     )
     
     # ========== 6. TRAINING SETUP ==========
-    total_epoch = int(op.iterations / len(trainingset))
     global_step = start_epoch * len(train_loader)
     res_scale_buffer = []  # Track resolution scaling
     current_render_scale = training_scheduler.max_reso_scale  # Start at lowest resolution
-    
-    if dp.densify_until < 0 or dp.densify_until_iter < 0:
-        dp.densify_until = int(
-            total_epoch * 0.8 / dp.opacity_reset_interval
-        ) * dp.opacity_reset_interval + 1
-        dp.densify_until_iter = int(op.iterations * 0.8)
-    
+
     StatisticsHelperInst.reset(
         xyz.shape[-2], xyz.shape[-1], density_controller.is_densify_actived
     )
