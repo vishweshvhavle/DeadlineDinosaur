@@ -177,10 +177,11 @@ def start(
     res_scale_buffer = []  # Track resolution scaling
     current_render_scale = training_scheduler.max_reso_scale  # Start at lowest resolution
     
-    if dp.densify_until < 0:
+    if dp.densify_until < 0 or dp.densify_until_iter < 0:
         dp.densify_until = int(
             total_epoch * 0.8 / dp.opacity_reset_interval
         ) * dp.opacity_reset_interval + 1
+        dp.densify_until_iter = int(op.iterations * 0.8)
     
     StatisticsHelperInst.reset(
         xyz.shape[-2], xyz.shape[-1], density_controller.is_densify_actived

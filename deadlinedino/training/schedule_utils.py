@@ -30,7 +30,7 @@ class TrainingScheduler():
 		self.reso_scales = None
 		self.reso_level_significance = None
 		self.reso_level_begin = None
-		self.increase_reso_until = self.densify_until_iter
+		self.increase_reso_until = dens.reso_until_iter
 		self.next_i = 2
 
 		# === HYBRID BUDGETING PARAMETERS ===
@@ -143,23 +143,7 @@ class TrainingScheduler():
 			
 			# === PHASE 2: Fixed Linear Target (LiteGS style) ===
 			if self.has_transitioned:
-				# Linear interpolation from current to target
-				remaining_iters = self.densify_until_iter - iteration
-				if remaining_iters <= 0:
-					return 0.0
-				
-				# Calculate how many steps remain
-				remaining_steps = max(1, remaining_iters // self.densification_interval)
-				
-				# Linear growth to target
-				total_to_add = max(0, self.fixed_target - cur_n_gaussian)
-				per_step_add = total_to_add / remaining_steps
-				densify_rate = per_step_add / self.init_n_gaussian
-				
-				if iteration % 100 == 0:
-					print(f"[DENSIFY] Phase 2 (Fixed): iter={iteration}, "
-					      f"current={cur_n_gaussian}, target={self.fixed_target:.0f}, "
-					      f"to_add={total_to_add:.0f}, rate={densify_rate:.3f}")
+				return None
 			
 			# === PHASE 1: Momentum-Based (DashGaussian style) ===
 			else:
