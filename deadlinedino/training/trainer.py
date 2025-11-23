@@ -446,7 +446,7 @@ def _should_timeout(elapsed_time, current_epoch, start_epoch):
     if current_epoch == start_epoch:
         return False
     avg_epoch_time = elapsed_time / (current_epoch - start_epoch)
-    return elapsed_time >= 60 - avg_epoch_time - 0.5
+    return elapsed_time >= 59 - avg_epoch_time - 0.5
 
 
 def _save_timeout_checkpoint(lp, pp, op, epoch, total_epoch, elapsed_time,
