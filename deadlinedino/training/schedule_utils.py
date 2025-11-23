@@ -58,6 +58,9 @@ class TrainingScheduler():
 			print(f"[SCHEDULER] Hybrid mode: momentum → fixed at full resolution")
 			print(f"[SCHEDULER] Initial Pfin={self.max_n_gaussian} (5x init)")
 		
+		print(f"[SCHEDULER] Densify until iteration: {self.densify_until_iter}")
+		print(f"[SCHEDULER] Resolution mode: {self.resolution_mode}")
+		
 		# Generate schedulers
 		self.init_reso_scheduler(original_images)
 
@@ -131,11 +134,14 @@ class TrainingScheduler():
 		- Phase 1 (scale > 1): DashGaussian momentum-based
 		- Phase 2 (scale = 1): LiteGS fixed linear target
 		"""
+		print(f"[DENSIFY] Getting densify rate at iteration {iteration}, Densify Mode: {self.densify_mode}")
 		if self.densify_mode == "free":
 			return 1.0
 		
 		elif self.densify_mode == "freq":
 			assert cur_scale is not None, "cur_scale required for freq mode"
+
+			print(f"[DENSIFY][Iter {iteration}] Current Scale: {cur_scale}, Current Primitives: {cur_n_gaussian}, Has Transitioned: {self.has_transitioned}")
 			
 			# Check if we've reached full resolution
 			if cur_scale == 1 and not self.has_transitioned:

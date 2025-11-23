@@ -79,7 +79,7 @@ class PipelineParams(ParamGroup):
     resolution_mode = "const"
     
     # --- ADDED THESE ---
-    densify_mode = "free"
+    densify_mode = "freq"
     max_n_gaussian = -1
     # --- END ADD ---
 

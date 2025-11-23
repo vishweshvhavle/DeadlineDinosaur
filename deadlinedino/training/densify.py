@@ -333,11 +333,13 @@ class DensityControllerOfficial(DensityControllerBase):
             if epoch % self.densify_params.densification_interval == 0:
                 # Get densify rate from scheduler if available
                 densify_rate = None
+                print(f"[DENSIFY][Epoch {epoch}] Densification step triggered. Current Render Scale: {current_render_scale}")
                 if scheduler is not None and current_iteration is not None and \
                    current_n_primitives is not None and current_render_scale is not None:
                     densify_rate = scheduler.get_densify_rate(
                         current_iteration, current_n_primitives, current_render_scale
                     )
+                    print(f"[DENSIFY][Epoch {epoch}] Densify rate from scheduler: {densify_rate}")
 
                 # Perform densification
                 momentum_add = self.split_and_clone(optimizer, epoch, densify_rate)
