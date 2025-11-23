@@ -18,7 +18,7 @@ class TrainingScheduler():
 		self.init_n_gaussian = init_n_gaussian
 
 		self.densify_mode = pipe.densify_mode
-		self.densify_until_iter = dens.densify_until
+		self.densify_until_iter = dens.densify_until_iter
 		self.densification_interval = dens.densification_interval
 		
 		self.resolution_mode = pipe.resolution_mode
@@ -137,26 +137,39 @@ class TrainingScheduler():
 		print(f"[DENSIFY] Getting densify rate at iteration {iteration}, Densify Mode: {self.densify_mode}")
 		if self.densify_mode == "free":
 			return 1.0
-		
+
 		elif self.densify_mode == "freq":
 			assert cur_scale is not None, "cur_scale required for freq mode"
 
 			print(f"[DENSIFY][Iter {iteration}] Current Scale: {cur_scale}, Current Primitives: {cur_n_gaussian}, Has Transitioned: {self.has_transitioned}")
-			
+
 			# Check if we've reached full resolution
 			if cur_scale == 1 and not self.has_transitioned:
 				self.transition_to_fixed_target(iteration, cur_n_gaussian)
-			
+
 			# === PHASE 2: Fixed Linear Target (LiteGS style) ===
 			if self.has_transitioned:
 				return None
-			
+
 			# === PHASE 1: Momentum-Based (DashGaussian style) ===
 			else:
+				# Safety check: ensure densify_until_iter is valid
+				if self.densify_until_iter <= 0:
+					print(f"[DENSIFY] WARNING: Invalid densify_until_iter={self.densify_until_iter}, defaulting to no densification")
+					return 0.0
+
 				# DashGaussian Eq.4 with power factor decay
 				progress = iteration / self.densify_until_iter
 				power_factor = 2.0 - progress  # 2.0 → 1.0
-				
+
+				# Safety check: clamp power_factor to prevent overflow
+				# For cur_scale=4, power_factor should be <= ~15 to avoid overflow
+				# For cur_scale=8, power_factor should be <= ~10
+				max_safe_power = 15.0 if cur_scale <= 4 else 10.0
+				if power_factor > max_safe_power:
+					print(f"[DENSIFY] WARNING: power_factor={power_factor:.2f} too high, clamping to {max_safe_power}")
+					power_factor = max_safe_power
+
 				denominator = cur_scale ** power_factor
 				target_n_primitives = self.init_n_gaussian + \
 				                     (self.max_n_gaussian - self.init_n_gaussian) / denominator
